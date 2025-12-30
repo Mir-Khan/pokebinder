@@ -1,335 +1,308 @@
-import os, json, requests, webbrowser, tkinter as tk
-from tkinter import ttk
+import os, json, requests, webbrowser, threading, urllib.parse, re
+import tkinter as tk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
-from io import BytesIO
-import threading
 
 SAVE_FILE = "my_collection.json"
+CACHE_DIR = "card_cache"
+if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
 class TCGApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("TCG Binder - Solar & Lunar")
-        self.root.geometry("1100x850") 
+        self.root.title("TCG Binder - Interactive Edition")
+        self.root.geometry("1500x900") 
         
-        # --- Theme State ---
         self.dark_mode = tk.BooleanVar(value=True)
         self.themes = {
-            "solar": {
-                "bg": "#FFFBE6", "fg": "#5C4033", "accent": "#FFA500", 
-                "card_bg": "#FFFFFF", "btn": "#FFD700", "label": "Solar Mode"
-            },
-            "lunar": {
-                "bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#4B0082", 
-                "card_bg": "#16213E", "btn": "#0F3460", "label": "Lunar Mode"
-            }
+            "solar": {"bg": "#FFFBE6", "fg": "#5C4033", "accent": "#FFA500", "card_bg": "#FFFFFF", "btn": "#FFD700", "hl": "#FFD700", "owned": "#4CAF50", "text": "#000000"},
+            "lunar": {"bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#4B0082", "card_bg": "#16213E", "btn": "#3E4A89", "hl": "#FFD700", "owned": "#2E7D32", "text": "#FFFFFF"}
         }
         
-        # --- UI Variables ---
-        self.sheets_var = tk.StringVar(value="10") 
-        self.row_var = tk.StringVar(value="3")
-        self.col_var = tk.StringVar(value="3")
-        self.search_var = tk.StringVar()
-        self.missing_only_var = tk.BooleanVar(value=False) # NEW: Missing filter state
-        self.page_selection = tk.StringVar()
-        self.manual_code_var = tk.StringVar()
-        self.status_var = tk.StringVar()
+        self.b_rows, self.b_cols = tk.StringVar(value="3"), tk.StringVar(value="3")
+        self.b_total_pages = tk.StringVar(value="10")
+        self.s_rows, self.s_cols = tk.StringVar(value="4"), tk.StringVar(value="4")
         
-        # Initial capacity calculation to prevent crash
-        self.total_capacity = int(self.sheets_var.get()) * int(self.row_var.get()) * int(self.col_var.get())
+        self.jump_search_var = tk.StringVar(value="1")
+        self.jump_binder_var = tk.StringVar(value="1")
+        self.max_search_pages_var = tk.StringVar(value="Max: 1")
+        self.max_binder_pages_var = tk.StringVar(value="Max: 1")
         
-        # --- State ---
-        self.card_data = []      
-        self.filtered_data = []  
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *args: self.apply_filter())
+        
+        self.binder_filter_var = tk.StringVar()
+        self.binder_filter_var.trace_add("write", lambda *args: self.apply_binder_filter())
+        
+        self.status_var = tk.StringVar(value="Ready")
+        self.progress_text = tk.StringVar(value="Load a set...")
+        self.binder_page, self.search_page = 1, 1
+        
+        self.full_set_data = [] 
+        self.display_search_data = [] 
         self.owned_cards = self.load_collection()
-        self.selected_to_buy = set()
-        self.current_page = 1
-        self.raw_images = {}
-        self.official_codes_map = {} 
-
+        self.display_owned_cards = self.owned_cards.copy()
+        self.current_set_name = ""
+        
         self.setup_ui()
-        self.apply_theme() 
-        self.apply_live_config()
-        
-        # Observers for real-time filtering
-        self.search_var.trace_add("write", lambda *args: self.apply_filter())
-        
-        threading.Thread(target=self.fetch_official_codes, daemon=True).start()
+        self.apply_theme()
+        self.root.after(100, self.refresh_view)
 
     def load_collection(self):
         if os.path.exists(SAVE_FILE):
             try:
-                with open(SAVE_FILE, 'r') as f: return set(json.load(f))
-            except: return set()
-        return set()
+                with open(SAVE_FILE, 'r') as f: return json.load(f)
+            except: return []
+        return []
+
+    def save_collection(self):
+        with open(SAVE_FILE, 'w') as f: json.dump(self.owned_cards, f)
+
+    def handle_load(self, event=None):
+        query = self.set_entry.get().strip()
+        def fetch():
+            try:
+                self.status_var.set(f"Searching for '{query}'...")
+                res = requests.get("https://api.tcgdex.net/v2/en/sets").json()
+                match = next(s for s in res if query.lower() in s['name'].lower())
+                full = requests.get(f"https://api.tcgdex.net/v2/en/sets/{match['id']}").json()
+                self.current_set_name = match['name']
+                self.full_set_data = [{'id': c['id'], 'name': c['name'], 'image': f"{c['image']}/low.jpg", 'set_name': self.current_set_name, 'set_id': match['id']} for c in full['cards']]
+                self.display_search_data = self.full_set_data.copy()
+                self.root.after(0, self.reset_and_refresh)
+                self.status_var.set(f"Loaded {self.current_set_name}")
+            except Exception as e: self.status_var.set(f"❌ Error: {str(e)}")
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def setup_ui(self):
+        self.top = tk.Frame(self.root, pady=10); self.top.pack(fill="x", side="top")
+        
+        # --- Binder Config with Apply Button ---
+        b_cfg = ttk.LabelFrame(self.top, text="Binder Config"); b_cfg.pack(side="left", padx=5)
+        ttk.Label(b_cfg, text="Grid:").pack(side="left", padx=2)
+        ttk.Entry(b_cfg, width=2, textvariable=self.b_rows).pack(side="left")
+        ttk.Label(b_cfg, text="x").pack(side="left")
+        ttk.Entry(b_cfg, width=2, textvariable=self.b_cols).pack(side="left")
+        tk.Label(b_cfg, text=" Pages:", font=("Arial", 8)).pack(side="left", padx=2)
+        ttk.Entry(b_cfg, width=3, textvariable=self.b_total_pages).pack(side="left")
+        ttk.Button(b_cfg, text="Apply", command=self.refresh_view).pack(side="left", padx=5)
+        
+        s_cfg = ttk.LabelFrame(self.top, text="Search Config"); s_cfg.pack(side="left", padx=5)
+        ttk.Entry(s_cfg, width=2, textvariable=self.s_rows).pack(side="left")
+        ttk.Label(s_cfg, text="x").pack(side="left")
+        ttk.Entry(s_cfg, width=2, textvariable=self.s_cols).pack(side="left")
+        ttk.Button(s_cfg, text="Apply", command=self.refresh_view).pack(side="left", padx=5)
+        
+        tools = ttk.LabelFrame(self.top, text="Search Set"); tools.pack(side="left", padx=5)
+        self.set_entry = ttk.Entry(tools, width=15); self.set_entry.insert(0, "Surging Sparks"); self.set_entry.pack(side="left", padx=2)
+        self.set_entry.bind("<Return>", self.handle_load)
+        ttk.Button(tools, text="Load", command=self.handle_load).pack(side="left")
+        
+        self.prog_frame = ttk.LabelFrame(self.top, text="Set Progress"); self.prog_frame.pack(side="left", padx=5)
+        tk.Label(self.prog_frame, textvariable=self.progress_text, font=("Arial", 8)).pack(padx=5)
+        
+        tk.Checkbutton(self.top, text="🌙 Theme", variable=self.dark_mode, command=self.apply_theme, indicatoron=False).pack(side="right", padx=10)
+        
+        self.paned = tk.PanedWindow(self.root, orient="horizontal", sashwidth=6); self.paned.pack(fill="both", expand=True)
+        self.left_pane = self.create_scrollable_pane(self.paned, "MY BINDER", "binder")
+        self.right_pane = self.create_scrollable_pane(self.paned, "SET SEARCH", "search")
+        self.status_lbl = tk.Label(self.root, textvariable=self.status_var, relief="flat", anchor="w"); self.status_lbl.pack(side="bottom", fill="x")
+
+    def create_scrollable_pane(self, parent, title, type_name):
+        frame = tk.Frame(parent); parent.add(frame, stretch="always")
+        header = tk.Frame(frame); header.pack(fill="x", pady=5)
+        tk.Label(header, text=title, font=('Segoe UI', 11, 'bold')).pack(side="left", padx=10)
+        
+        nav = tk.Frame(header); nav.pack(side="right", padx=10)
+        
+        if type_name == "binder":
+            tk.Label(header, text="Filter Binder:", font=("Arial", 8)).pack(side="left", padx=(10, 2))
+            self.binder_filter_entry = ttk.Entry(header, width=12, textvariable=self.binder_filter_var)
+            self.binder_filter_entry.pack(side="left", padx=2)
+
+            tk.Button(header, text="Empty", bg="#8B0000", fg="white", font=("Arial", 8), command=self.clear_binder).pack(side="left", padx=2)
+            tk.Button(header, text="Sort", bg="#4B0082", fg="white", font=("Arial", 8), command=self.sort_binder).pack(side="left", padx=2)
+            
+            tk.Label(nav, textvariable=self.max_binder_pages_var, font=("Arial", 8)).pack(side="left", padx=5)
+            jump = ttk.Entry(nav, width=3, textvariable=self.jump_binder_var)
+            jump.pack(side="left", padx=2)
+            jump.bind("<Return>", lambda e: self.jump_to_page("binder"))
+        else:
+            tk.Label(header, text="Filter Set:", font=("Arial", 8)).pack(side="left", padx=(10, 2))
+            self.filter_entry = ttk.Entry(header, width=12, textvariable=self.filter_var)
+            self.filter_entry.pack(side="left", padx=2)
+            
+            tk.Button(header, text="+ Full Set", bg="#2E7D32", fg="white", font=("Arial", 8), command=self.add_full_set).pack(side="left", padx=2)
+            tk.Label(nav, textvariable=self.max_search_pages_var, font=("Arial", 8)).pack(side="left", padx=5)
+            jump = ttk.Entry(nav, width=3, textvariable=self.jump_search_var)
+            jump.pack(side="left", padx=2)
+            jump.bind("<Return>", lambda e: self.jump_to_page("search"))
+
+        tk.Button(nav, text="<<<", command=lambda: self.change_page(type_name, -1)).pack(side="left", padx=1)
+        tk.Button(nav, text=">>>", command=lambda: self.change_page(type_name, 1)).pack(side="left", padx=1)
+        
+        container = tk.Frame(frame); container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        grid = tk.Frame(canvas); canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=v_scroll.set)
+        canvas.pack(side="left", fill="both", expand=True); v_scroll.pack(side="right", fill="y")
+        grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        return {"grid": grid, "canvas": canvas, "frame": frame, "header": header, "container": container}
+
+    def render_side(self, pane, data, page, is_binder, t, rows, cols):
+        for w in pane['grid'].winfo_children(): w.destroy()
+        pane['grid'].configure(bg=t["bg"])
+        
+        pane_width = pane['canvas'].winfo_width() or 700
+        card_w = int((pane_width / cols) - 25); per_page = rows * cols; offset = (page - 1) * per_page
+        
+        try: pages_val = int(self.b_total_pages.get())
+        except: pages_val = 1
+        total_capacity = rows * cols * pages_val if is_binder else 999999
+        
+        for i in range(per_page):
+            idx = offset + i
+            r, c = divmod(i, cols)
+            slot = tk.Frame(pane['grid'], bg=t["card_bg"], highlightthickness=2, highlightbackground=t["accent"], width=card_w, height=int(card_w*1.4)+85)
+            slot.grid(row=r, column=c, padx=5, pady=5); slot.grid_propagate(False)
+            
+            if idx < len(data):
+                card = data[idx]
+                tk.Label(slot, text=f"{card['name']}", bg=t["card_bg"], fg=t["text"], font=('Arial', 7, 'bold'), wraplength=card_w-10).pack(pady=2)
+                img_lbl = tk.Label(slot, text="Loading...", bg=t["card_bg"], fg=t["text"])
+                img_lbl.pack(expand=True, fill="both")
+                
+                if is_binder and idx >= total_capacity:
+                    warning = tk.Label(img_lbl, text="BEYOND BINDER CAPACITY", fg="white", bg="#D32F2F", font=("Arial", 7, "bold"), padx=5, pady=2)
+                    warning.place(relx=0.5, rely=0.05, anchor="n", relwidth=0.95)
+                
+                threading.Thread(target=lambda c=card, l=img_lbl, w=card_w-10: self.update_label_image(l, self.get_cached_image(c, w)), daemon=True).start()
+                
+                btn_f = tk.Frame(slot, bg=t["card_bg"]); btn_f.pack(side="bottom", fill="x", pady=2)
+                def make_remover(card_to_remove):
+                    return lambda: self.remove_card_by_object(card_to_remove)
+
+                tk.Button(btn_f, text="X" if is_binder else "Add", 
+                          command=make_remover(card) if is_binder else lambda c=card: self.quick_add(c), 
+                          bg="#8B0000" if is_binder else t["btn"], fg="white", font=('Arial', 7)).pack(side="left", fill="x", expand=True)
+                
+                search_q = f"{card['name']} {card.get('set_id', '').upper()}"
+                tk.Button(btn_f, text="Buy", command=lambda q=search_q: webbrowser.open(f"https://www.tcgplayer.com/search/all/product?q={urllib.parse.quote(q)}"), bg="#2B6CB0", fg="white", font=('Arial', 7)).pack(side="left", fill="x", expand=True)
+            elif is_binder and idx < total_capacity:
+                tk.Label(slot, text=f"Page { (idx // (rows*cols)) + 1}\nSlot {idx+1}", font=("Arial", 8), bg=t["card_bg"], fg=t["accent"]).place(relx=0.5, rely=0.5, anchor="center")
 
     def apply_theme(self):
         t = self.themes["lunar" if self.dark_mode.get() else "solar"]
         self.root.configure(bg=t["bg"])
-        
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("TFrame", background=t["bg"])
-        style.configure("TLabelframe", background=t["bg"], foreground=t["fg"])
-        style.configure("TLabelframe.Label", background=t["bg"], foreground=t["fg"], font=('Segoe UI', 10, 'bold'))
-        style.configure("TLabel", background=t["bg"], foreground=t["fg"])
-        style.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
-        style.configure("TButton", background=t["btn"], foreground="white", borderwidth=0)
-        style.map("TButton", background=[('active', t["accent"])])
-        
-        self.status_lbl.config(bg=t["btn"], fg="white")
-        self.update_stats()
-        self.refresh_binder()
+        self.top.configure(bg=t["bg"])
+        self.paned.configure(bg=t["bg"])
+        for p in [self.left_pane, self.right_pane]:
+            p["frame"].configure(bg=t["bg"])
+            p["header"].configure(bg=t["bg"])
+            p["container"].configure(bg=t["bg"])
+            p["canvas"].configure(bg=t["bg"])
+            p["grid"].configure(bg=t["bg"])
+            for child in p["header"].winfo_children():
+                try: child.configure(bg=t["bg"], fg=t["text"])
+                except: pass
+        self.refresh_view()
 
-    def setup_ui(self):
-        self.top = ttk.Frame(self.root, padding=10)
-        self.top.pack(fill="x", side="top")
-        
-        # 1. Config
-        layout_cfg = ttk.LabelFrame(self.top, text="Binder Config")
-        layout_cfg.pack(side="left", padx=5)
-        ttk.Entry(layout_cfg, width=3, textvariable=self.sheets_var).pack(side="left", padx=2)
-        ttk.Label(layout_cfg, text="x").pack(side="left")
-        ttk.Entry(layout_cfg, width=2, textvariable=self.row_var).pack(side="left")
-        ttk.Label(layout_cfg, text="x").pack(side="left")
-        ttk.Entry(layout_cfg, width=2, textvariable=self.col_var).pack(side="left")
-        ttk.Button(layout_cfg, text="Apply", width=6, command=self.apply_live_config).pack(side="left", padx=5)
-
-        # 2. Load
-        search_set = ttk.LabelFrame(self.top, text="Load Set")
-        search_set.pack(side="left", padx=5)
-        self.set_entry = ttk.Entry(search_set, width=12)
-        self.set_entry.insert(0, "Silver Tempest")
-        self.set_entry.pack(side="left", padx=2)
-        ttk.Button(search_set, text="Go", command=self.handle_load).pack(side="left")
-
-        # 3. Filters (Search + Missing Toggle)
-        filter_frame = ttk.LabelFrame(self.top, text="Filters")
-        filter_frame.pack(side="left", padx=5)
-        ttk.Entry(filter_frame, textvariable=self.search_var, width=12).pack(side="left", padx=5)
-        tk.Checkbutton(filter_frame, text="Missing Only", variable=self.missing_only_var, 
-                       command=self.apply_filter, bg=self.themes["lunar"]["bg"] if self.dark_mode.get() else self.themes["solar"]["bg"],
-                       fg="white" if self.dark_mode.get() else "black", activebackground="#4B0082").pack(side="left", padx=2)
-
-        # 4. Mass Entry
-        buy_tools = ttk.LabelFrame(self.top, text="Mass Actions")
-        buy_tools.pack(side="left", padx=5)
-        ttk.Button(buy_tools, text="Copy Selected", command=lambda: self.generate_entry("selected")).pack(side="left", padx=2)
-        ttk.Button(buy_tools, text="Copy Missing", command=lambda: self.generate_entry("all")).pack(side="left", padx=2)
-
-        # Theme Toggle
-        theme_btn = tk.Checkbutton(self.top, text="🌙 Night Theme", variable=self.dark_mode, 
-                                   command=self.apply_theme, onvalue=True, offvalue=False,
-                                   bg="#4B0082", fg="white", selectcolor="#1A1A2E", indicatoron=False, padx=10)
-        theme_btn.pack(side="right", padx=10)
-
-        # Navigation
-        self.nav_bar = ttk.Frame(self.root, padding=10)
-        self.nav_bar.pack(fill="x", side="bottom")
-        ttk.Button(self.nav_bar, text="<<<", width=5, command=self.prev_page).pack(side="left")
-        
-        nav_group = ttk.Frame(self.nav_bar)
-        nav_group.pack(side="left", expand=True)
-        self.page_dropdown = ttk.Combobox(nav_group, textvariable=self.page_selection, state="readonly", width=25)
-        self.page_dropdown.pack(side="left", padx=5)
-        self.page_dropdown.bind("<<ComboboxSelected>>", self.on_page_select)
-        self.total_pages_lbl = ttk.Label(nav_group, text="of 0") 
-        self.total_pages_lbl.pack(side="left")
-        
-        self.progress_lbl = ttk.Label(self.nav_bar, text="0/0")
-        self.progress_lbl.pack(side="left", padx=10)
-        ttk.Button(self.nav_bar, text=">>>", width=5, command=self.next_page).pack(side="right")
-
-        self.status_lbl = tk.Label(self.root, textvariable=self.status_var, relief="flat", anchor="w", font=('Arial', 9))
-        self.status_lbl.pack(side="bottom", fill="x")
-
-        # Scrollable Area
-        container = ttk.Frame(self.root)
-        container.pack(fill="both", expand=True, padx=10, pady=5)
-        self.canvas = tk.Canvas(container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
-        self.binder_frame = ttk.Frame(self.canvas)
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.binder_frame, anchor="nw")
-        self.binder_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-
-    def fetch_official_codes(self):
+    def jump_to_page(self, mode):
         try:
-            res = requests.get("https://api.pokemontcg.io/v2/sets").json()
-            for s in res['data']:
-                code = s.get('ptcgoCode') or s.get('id').upper()
-                self.official_codes_map[s['name'].lower()] = code
+            if mode == "binder": 
+                self.binder_page = max(1, int(self.jump_binder_var.get()))
+            else: 
+                self.search_page = max(1, int(self.jump_search_var.get()))
+            self.refresh_view()
         except: pass
 
-    def handle_load(self):
-        query = self.set_entry.get().strip()
-        try:
-            res = requests.get("https://api.tcgdex.net/v2/en/sets").json()
-            match = next(s for s in res if query.lower() in s['name'].lower())
-            found_code = self.official_codes_map.get(match['name'].lower())
-            self.manual_code_var.set(found_code if found_code else match['id'].upper())
-            full_set = requests.get(f"https://api.tcgdex.net/v2/en/sets/{match['id']}").json()
-            self.card_data = [{'id': c['id'], 'num': c['localId'], 'name': c['name'], 'image': f"{c['image']}/low.jpg"} for c in full_set['cards']]
-            self.current_page = 1
-            self.raw_images.clear()
-            self.apply_filter()
-        except: self.status_var.set("❌ Set not found.")
+    def change_page(self, n, d):
+        if n == "binder": 
+            self.binder_page = max(1, self.binder_page + d)
+            self.jump_binder_var.set(str(self.binder_page))
+        else: 
+            self.search_page = max(1, self.search_page + d)
+            self.jump_search_var.set(str(self.search_page))
+        self.refresh_view()
+
+    def refresh_view(self):
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
+        
+        per_search = int(self.s_rows.get()) * int(self.s_cols.get())
+        max_s = (len(self.display_search_data) + per_search - 1) // per_search
+        self.max_search_pages_var.set(f"Max: {max(1, max_s)}")
+        
+        per_binder = int(self.b_rows.get()) * int(self.b_cols.get())
+        max_b = (len(self.display_owned_cards) + per_binder - 1) // per_binder
+        self.max_binder_pages_var.set(f"Max: {max(1, max_b)}")
+
+        self.render_side(self.left_pane, self.display_owned_cards, self.binder_page, True, t, int(self.b_rows.get()), int(self.b_cols.get()))
+        self.render_side(self.right_pane, self.display_search_data, self.search_page, False, t, int(self.s_rows.get()), int(self.s_cols.get()))
+        self.update_progress()
+
+    def update_label_image(self, lbl, photo):
+        if photo: self.root.after(0, lambda: lbl.config(image=photo, text="")); lbl.image = photo
+
+    def get_cached_image(self, card, width):
+        path = os.path.join(CACHE_DIR, f"{card['id']}.jpg")
+        if not os.path.exists(path):
+            try: r = requests.get(card['image'], timeout=5); open(path, "wb").write(r.content)
+            except: return None
+        try: img = Image.open(path).resize((width, int(width * 1.4)), Image.Resampling.LANCZOS); return ImageTk.PhotoImage(img)
+        except: return None
+
+    def add_full_set(self): 
+        self.owned_cards.extend(self.full_set_data)
+        self.apply_binder_filter()
+        self.save_collection()
+        self.refresh_view()
+
+    def quick_add(self, card): 
+        self.owned_cards.append(card)
+        self.apply_binder_filter()
+        self.save_collection()
+        self.refresh_view()
+
+    def remove_card_by_object(self, card_obj):
+        if card_obj in self.owned_cards:
+            self.owned_cards.remove(card_obj)
+            self.apply_binder_filter()
+            self.save_collection()
+            self.refresh_view()
+
+    def sort_binder(self): 
+        self.owned_cards.sort(key=lambda x: x['name'].lower())
+        self.apply_binder_filter()
+        self.save_collection()
+        self.refresh_view()
+
+    def clear_binder(self): 
+        self.owned_cards = []
+        self.apply_binder_filter()
+        self.save_collection()
+        self.refresh_view()
 
     def apply_filter(self):
-        term = self.search_var.get().lower()
-        show_missing_only = self.missing_only_var.get()
-        
-        self.filtered_data = []
-        for c in self.card_data:
-            match_search = term in c['name'].lower()
-            match_missing = (c['id'] not in self.owned_cards) if show_missing_only else True
-            
-            if match_search and match_missing:
-                self.filtered_data.append(c)
-                
-        self.current_page = 1
-        self.apply_live_config()
+        q = self.filter_var.get().lower()
+        self.display_search_data = [c for c in self.full_set_data if q in c['name'].lower()] if q else self.full_set_data.copy()
+        self.search_page = 1
+        self.jump_search_var.set("1")
+        self.refresh_view()
 
-    def apply_live_config(self):
-        try:
-            self.slots_per_page = int(self.row_var.get()) * int(self.col_var.get())
-            self.total_capacity = int(self.sheets_var.get()) * self.slots_per_page
-            cols = int(self.col_var.get())
-            for i in range(cols): self.binder_frame.grid_columnconfigure(i, weight=1)
+    def apply_binder_filter(self):
+        q = self.binder_filter_var.get().lower()
+        self.display_owned_cards = [c for c in self.owned_cards if q in c['name'].lower()] if q else self.owned_cards.copy()
+        self.binder_page = 1
+        self.jump_binder_var.set("1")
+        self.refresh_view()
 
-            if self.filtered_data:
-                total_cards = len(self.filtered_data)
-                max_pages = (total_cards + self.slots_per_page - 1) // self.slots_per_page
-                if self.current_page > max_pages: self.current_page = 1
-                self.update_navigation_options()
-                self.refresh_binder()
-                self.update_stats()
-            else:
-                for w in self.binder_frame.winfo_children(): w.destroy()
-                self.update_stats()
-        except: pass
+    def update_progress(self):
+        if self.current_set_name:
+            owned = len([c for c in self.owned_cards if c.get('set_name') == self.current_set_name])
+            self.progress_text.set(f"{self.current_set_name}: {owned}/{len(self.full_set_data)}")
 
-    def refresh_binder(self):
-        for w in self.binder_frame.winfo_children(): w.destroy()
-        if not self.filtered_data: return
-        
-        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
-        self.canvas.config(bg=t["bg"])
-        self.binder_frame.config(style="TFrame")
-
-        offset = (self.current_page - 1) * self.slots_per_page
-        cols = int(self.col_var.get())
-        canvas_width = self.canvas.winfo_width() if self.canvas.winfo_width() > 100 else 1000
-        target_img_width = int((canvas_width / cols) * 0.75)
-        target_img_height = int(target_img_width * 1.4)
-
-        for i in range(self.slots_per_page):
-            idx = offset + i
-            if idx >= len(self.filtered_data): break
-            r, c = divmod(i, cols)
-            
-            # Maintain capacity check relative to full set
-            original_idx = next((i for i, item in enumerate(self.card_data) if item["id"] == self.filtered_data[idx]["id"]), 0)
-            fits = original_idx < self.total_capacity
-            
-            slot = tk.Frame(self.binder_frame, bg=t["card_bg"], highlightbackground=t["accent"], highlightthickness=1)
-            slot.grid(row=r, column=c, padx=8, pady=8, sticky="nsew")
-            
-            card = self.filtered_data[idx]
-            if card['id'] in self.raw_images:
-                photo = self.scale_image(self.raw_images[card['id']], target_img_width, target_img_height)
-                self.render_card_ui(slot, photo, card, fits, t)
-            else: 
-                threading.Thread(target=self.load_image_to_slot, args=(slot, card, fits, target_img_width, target_img_height, t), daemon=True).start()
-
-    def scale_image(self, pil_img, w, h):
-        resized = pil_img.resize((w, h), Image.Resampling.LANCZOS)
-        return ImageTk.PhotoImage(resized)
-
-    def load_image_to_slot(self, frame, card, fits, w, h, t):
-        try:
-            res = requests.get(card['image'], timeout=10)
-            pil_img = Image.open(BytesIO(res.content))
-            self.raw_images[card['id']] = pil_img
-            photo = self.scale_image(pil_img, w, h)
-            self.root.after(0, lambda: self.render_card_ui(frame, photo, card, fits, t))
-        except: pass
-
-    def render_card_ui(self, frame, photo, card, fits, t):
-        for w in frame.winfo_children(): w.destroy()
-        lbl = tk.Label(frame, image=photo, bg=t["card_bg"])
-        lbl.image = photo 
-        lbl.pack(pady=5)
-        
-        info_color = t["fg"] if fits else "red"
-        txt = f"#{card['num']} - {card['name']}" if fits else "BEYOND CAPACITY"
-        tk.Label(frame, text=txt, fg=info_color, bg=t["card_bg"], font=('Segoe UI', 9, 'bold')).pack()
-        
-        btn_f = tk.Frame(frame, bg=t["card_bg"])
-        btn_f.pack(pady=2)
-        o_var = tk.BooleanVar(value=card['id'] in self.owned_cards)
-        tk.Checkbutton(btn_f, text="Own", variable=o_var, command=lambda: self.toggle_owned(card['id'], o_var.get()),
-                       bg=t["card_bg"], fg=t["fg"], selectcolor=t["bg"], activebackground=t["card_bg"]).grid(row=0, column=0, padx=5)
-        
-        b_var = tk.BooleanVar(value=card['id'] in self.selected_to_buy)
-        tk.Checkbutton(btn_f, text="List", variable=b_var, command=lambda: self.toggle_buy(card['id'], b_var.get()),
-                       bg=t["card_bg"], fg=t["fg"], selectcolor=t["bg"], activebackground=t["card_bg"]).grid(row=0, column=1, padx=5)
-
-        tk.Button(frame, text="Buy Single", command=lambda: self.buy_single(card['name']), 
-                  bg=t["btn"], fg="white", relief="flat", font=('Arial', 8)).pack(fill="x", padx=20, pady=5)
-
-    def update_navigation_options(self):
-        total_cards = len(self.filtered_data)
-        num_pages = (total_cards + self.slots_per_page - 1) // self.slots_per_page
-        self.total_pages_lbl.config(text=f"of {num_pages}")
-        self.page_dropdown['values'] = [f"Page {p}" for p in range(1, num_pages + 1)]
-        if self.page_dropdown['values']: self.page_dropdown.current(min(self.current_page - 1, len(self.page_dropdown['values'])-1))
-
-    def on_page_select(self, event):
-        self.current_page = self.page_dropdown.current() + 1
-        self.refresh_binder()
-
-    def update_stats(self):
-        owned = sum(1 for c in self.card_data if c['id'] in self.owned_cards)
-        total = len(self.card_data)
-        self.progress_lbl.config(text=f"Progress: {owned}/{total}")
-        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
-        self.status_var.set(f"Theme: {t['label']} | Binder Capacity: {self.total_capacity} slots")
-
-    def toggle_owned(self, cid, val):
-        if val: self.owned_cards.add(cid)
-        else: self.owned_cards.discard(cid)
-        with open(SAVE_FILE, 'w') as f: json.dump(list(self.owned_cards), f)
-        self.update_stats()
-        if self.missing_only_var.get(): self.apply_filter()
-
-    def toggle_buy(self, cid, val):
-        if val: self.selected_to_buy.add(cid)
-        else: self.selected_to_buy.discard(cid)
-
-    def buy_single(self, card_name):
-        clean_name = card_name.replace("é", "e").replace(" ", "+")
-        set_name = self.set_entry.get().replace(" ", "+")
-        webbrowser.open(f"https://www.tcgplayer.com/search/pokemon/product?q={clean_name}+{set_name}")
-
-    def generate_entry(self, mode):
-        target_ids = self.selected_to_buy if mode == "selected" else [c['id'] for c in self.card_data if c['id'] not in self.owned_cards]
-        set_code = self.manual_code_var.get().strip().upper()
-        list_text = "".join([f"1 {c['name'].replace('é', 'e')} [{set_code}]\n" for c in self.card_data if c['id'] in target_ids])
-        self.root.clipboard_clear(); self.root.clipboard_append(list_text)
-        webbrowser.open("https://www.tcgplayer.com/massentry")
-
-    def prev_page(self): 
-        if self.current_page > 1: self.current_page -= 1; self.refresh_binder()
-    def next_page(self): 
-        if (self.current_page * self.slots_per_page) < len(self.filtered_data): self.current_page += 1; self.refresh_binder()
+    def reset_and_refresh(self): self.search_page = 1; self.refresh_view()
 
 if __name__ == "__main__":
     root = tk.Tk(); app = TCGApp(root); root.mainloop()
