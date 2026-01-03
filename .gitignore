@@ -1,3 +1,8 @@
 /.env
 /my_collection.json
 /card_cache
+/imgs/*.png
+tcg_data.json
+tcg_debug.log
+/binders/*.json
+.vscode
