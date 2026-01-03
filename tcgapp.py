@@ -62,10 +62,26 @@ class TCGApp:
         self.max_binder_pages_var = tk.StringVar(value="Max: 1")
         
         self.binder_title_var = tk.StringVar(value=self.current_binder_name.upper())
+        
+        # Debounce timers
+        self._search_filter_timer = None
+        self._binder_filter_timer = None
+
+        def on_search_filter_change(*args):
+            if self._search_filter_timer:
+                self.root.after_cancel(self._search_filter_timer)
+            self._search_filter_timer = self.root.after(600, self.apply_filter)
+
+        def on_binder_filter_change(*args):
+            if self._binder_filter_timer:
+                self.root.after_cancel(self._binder_filter_timer)
+            self._binder_filter_timer = self.root.after(600, lambda: self.apply_binder_filter(reset_page=True))
+
         self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *args: self.apply_filter())
+        self.filter_var.trace_add("write", on_search_filter_change)
+        
         self.binder_filter_var = tk.StringVar()
-        self.binder_filter_var.trace_add("write", lambda *args: self.apply_binder_filter(reset_page=True))
+        self.binder_filter_var.trace_add("write", on_binder_filter_change)
         
         self.status_var = tk.StringVar(value="Ready")
         self.progress_text = tk.StringVar(value="No set loaded")
@@ -121,7 +137,7 @@ class TCGApp:
             logger.info(f"Applying binder grid: {rows} rows x {cols} cols")
             
             # Re-render the current page with the updated grid
-            self.refresh_view()
+            self.refresh_view(target="binder")
         except ValueError as e:
             logger.error(f"Invalid grid size: {e}")
             messagebox.showerror("Invalid Input", "Rows and columns must be positive integers.")
@@ -349,7 +365,7 @@ class TCGApp:
         self.paned = tk.PanedWindow(self.content_frame, orient="horizontal", sashwidth=4, bg="#333333"); self.paned.pack(fill="both", expand=True)
         
         self.left_pane = self.create_scrollable_pane(self.paned, self.binder_title_var, "binder")
-        self.right_pane = self.create_scrollable_pane(self.paned, tk.StringVar(value="SET SEARCH"), "search")
+        self.right_pane = self.create_scrollable_pane(self.paned, tk.StringVar(value="Filter"), "search")
         
         self.setup_binder_header()
         self.setup_search_header()
@@ -369,7 +385,7 @@ class TCGApp:
         tk.Button(h, text="Sort", command=self.sort_binder, bg="#555", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
         tk.Button(h, text="Empty", command=self.clear_binder, bg="#8B0000", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
         tk.Button(h, text="+Full", command=self.add_full_set_to_binder, bg="#2E7D32", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
-        tk.Button(h, text="Set", command=self.refresh_view, bg="#3E4A89", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
+        tk.Button(h, text="Set", command=self.refresh_view(target="binder"), bg="#3E4A89", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
 
     def setup_search_header(self):
         h = self.right_pane['header_tools']
@@ -379,7 +395,7 @@ class TCGApp:
         ttk.Entry(g_f, width=2, textvariable=self.s_rows).pack(side="left")
         tk.Label(g_f, text="x", font=("Arial", 8)).pack(side="left")
         ttk.Entry(g_f, width=2, textvariable=self.s_cols).pack(side="left")
-        tk.Button(g_f, text="Set", command=self.refresh_view, font=("Arial", 8), padx=3).pack(side="left", padx=2)
+        tk.Button(g_f, text="Set", command=self.refresh_view(target="binder"), font=("Arial", 8), padx=3).pack(side="left", padx=2)
         l_f = tk.Frame(h); l_f.pack(side="left", padx=5)
         self.set_entry = ttk.Entry(l_f, width=12); self.set_entry.insert(0, "Surging Sparks"); self.set_entry.pack(side="left")
         self.set_entry.bind("<Return>", self.handle_load)
@@ -587,30 +603,42 @@ class TCGApp:
     # NAVIGATION & PAGINATION
     # ==========================================
     def change_page(self, type_name, delta):
-        if type_name == "binder": self.binder_page = max(1, self.binder_page + delta); self.jump_binder_var.set(str(self.binder_page))
-        else: self.search_page = max(1, self.search_page + delta); self.jump_search_var.set(str(self.search_page))
-        self.refresh_view()
+        if type_name == "binder": 
+            self.binder_page = max(1, self.binder_page + delta); self.jump_binder_var.set(str(self.binder_page))
+            self.refresh_view(target="binder")
+        else: 
+            self.search_page = max(1, self.search_page + delta); self.jump_search_var.set(str(self.search_page))
+            self.refresh_view(target="search")
+        
 
     def go_to_first(self, type_name):
-        if type_name == "binder": self.binder_page = 1; self.jump_binder_var.set("1")
-        else: self.search_page = 1; self.jump_search_var.set("1")
-        self.refresh_view()
+        if type_name == "binder": 
+            self.binder_page = 1; self.jump_binder_var.set("1")
+            self.refresh_view(target="binder")
+        else: 
+            self.search_page = 1; self.jump_search_var.set("1")
+            self.refresh_view(target="search")
 
     def go_to_last(self, type_name):
         if type_name == "binder":
             per = int(self.b_rows.get()) * int(self.b_cols.get())
             max_b = (max(len(self.display_owned_cards), per * int(self.b_total_pages.get())) + per - 1) // per
             self.binder_page = max(1, max_b); self.jump_binder_var.set(str(self.binder_page))
+            self.refresh_view(target="binder")
         else:
             per = int(self.s_rows.get()) * int(self.s_cols.get()); max_s = (len(self.display_search_data) + per - 1) // per
             self.search_page = max(1, max_s); self.jump_search_var.set(str(self.search_page))
-        self.refresh_view()
+            self.refresh_view(target="search")
 
     def jump_to_page(self, type_name, event=None):
         try:
-            if type_name == "binder": self.binder_page = max(1, int(self.jump_binder_var.get()))
-            else: self.search_page = max(1, int(self.jump_search_var.get()))
-            self.refresh_view()
+            if type_name == "binder": 
+                self.binder_page = max(1, int(self.jump_binder_var.get()))
+                self.refresh_view(target="binder")
+            else: 
+                self.search_page = max(1, int(self.jump_search_var.get()))
+                self.refresh_view(target="search")
+            
         except Exception as e:
             logger.error(f"Invalid page jump: {e}")
 
@@ -666,23 +694,105 @@ class TCGApp:
     # ==========================================
     # API & EXTERNAL DATA LOADERS
     # ==========================================
+    def setup_search_header(self):
+        # Redefining header setup to include both Set and Card search options
+        h = self.right_pane['header_tools']
+        for w in h.winfo_children(): w.destroy()
+        
+        # Grid Controls
+        g_f = tk.Frame(h); g_f.pack(side="left", padx=5)
+        tk.Label(g_f, text="Grid:", font=("Arial", 8)).pack(side="left")
+        ttk.Entry(g_f, width=2, textvariable=self.s_rows).pack(side="left")
+        tk.Label(g_f, text="x", font=("Arial", 8)).pack(side="left")
+        ttk.Entry(g_f, width=2, textvariable=self.s_cols).pack(side="left")
+        tk.Button(g_f, text="Set", command=self.refresh_view, font=("Arial", 8), padx=3).pack(side="left", padx=2)
+        
+        # Set Search Controls
+        l_f = tk.Frame(h); l_f.pack(side="left", padx=5)
+        tk.Label(l_f, text="Set:", font=("Arial", 8, "bold")).pack(side="left")
+        self.set_entry = ttk.Entry(l_f, width=12); self.set_entry.insert(0, "Surging Sparks"); self.set_entry.pack(side="left")
+        self.set_entry.bind("<Return>", self.handle_load)
+        tk.Button(l_f, text="Load", command=self.handle_load, bg="#3E4A89", fg="white", font=("Arial", 8)).pack(side="left", padx=2)
+        
+        # Card Search Controls (New)
+        c_f = tk.Frame(h); c_f.pack(side="left", padx=5)
+        tk.Label(c_f, text="Card:", font=("Arial", 8, "bold")).pack(side="left")
+        self.card_search_entry = ttk.Entry(c_f, width=12); self.card_search_entry.pack(side="left")
+        self.card_search_entry.bind("<Return>", self.handle_card_search)
+        tk.Button(c_f, text="Find", command=self.handle_card_search, bg="#E65100", fg="white", font=("Arial", 8)).pack(side="left", padx=2)
+
+        tk.Label(h, textvariable=self.progress_text, font=("Arial", 8, "bold"), fg="#4CAF50").pack(side="right", padx=10)
+
     def handle_load(self, event=None):
         q = self.set_entry.get().strip()
-        self.status_var.set(f"Searching {q}...")
+        self.status_var.set(f"Searching Set: {q}...")
         logger.info(f"API Request: Searching for set '{q}'")
         def fetch():
             try:
                 res = requests.get("https://api.tcgdex.net/v2/en/sets").json()
-                match = next(s for s in res if q.lower() in s['name'].lower())
+                match = next((s for s in res if q.lower() in s['name'].lower()), None)
+                
+                if not match:
+                    self.status_var.set("Set not found")
+                    return
+
                 full = requests.get(f"https://api.tcgdex.net/v2/en/sets/{match['id']}").json()
                 self.current_set_name = match['name']
                 self.full_set_data = [{'id': c['id'], 'name': c['name'], 'image': f"{c['image']}/low.jpg", 'set_name': self.current_set_name, 'set_id': match['id']} for c in full['cards']]
                 self.display_search_data = self.full_set_data.copy()
+                self.search_page = 1
+                self.jump_search_var.set("1")
+                
                 logger.info(f"Successfully loaded {len(self.full_set_data)} cards from {self.current_set_name}")
-                self.root.after(0, self.refresh_view)  # Replace reset_and_refresh with refresh_view
+                self.root.after(0, self.refresh_view(target="search"))
+                self.root.after(0, lambda: self.status_var.set("Ready"))
             except Exception as e: 
                 logger.error(f"Failed to fetch set data: {e}")
                 self.status_var.set("Load failed")
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def handle_card_search(self, event=None):
+        q = self.card_search_entry.get().strip()
+        if not q: return
+        self.status_var.set(f"Searching Card: {q}...")
+        logger.info(f"API Request: Searching for card '{q}'")
+        def fetch():
+            try:
+                # Search for cards by name
+                url = f"https://api.tcgdex.net/v2/en/cards?name={urllib.parse.quote(q)}"
+                res = requests.get(url).json()
+                
+                if not res:
+                    self.status_var.set("No cards found")
+                    return
+
+                # Process results
+                cards = []
+                for c in res:
+                    # TCGDex search results usually have id, name, image (base url)
+                    if 'image' in c and c['image']:
+                        # Try to infer set name from ID if not present (e.g. swsh1-1 -> swsh1)
+                        s_id = c['id'].split('-')[0] if '-' in c['id'] else "Unknown"
+                        cards.append({
+                            'id': c['id'],
+                            'name': c['name'],
+                            'image': f"{c['image']}/low.jpg",
+                            'set_name': c.get('set', {}).get('name', s_id.upper()), # Fallback
+                            'set_id': s_id
+                        })
+                
+                self.current_set_name = f"Search: {q}"
+                self.full_set_data = cards
+                self.display_search_data = self.full_set_data.copy()
+                self.search_page = 1
+                self.jump_search_var.set("1")
+                
+                logger.info(f"Found {len(cards)} cards matching '{q}'")
+                self.root.after(0, self.refresh_view(target="search"))
+                self.root.after(0, lambda: self.status_var.set("Ready"))
+            except Exception as e:
+                logger.error(f"Card search failed: {e}")
+                self.status_var.set("Search failed")
         threading.Thread(target=fetch, daemon=True).start()
 
     # ==========================================
@@ -695,14 +805,52 @@ class TCGApp:
             for comp in ["frame", "header", "header_tools", "container", "canvas", "grid"]: p[comp].configure(bg=t["bg"])
         self.refresh_view()
 
-    def refresh_view(self):
+    def refresh_view(self, target="both"):
+        """
+        Refreshes the UI.
+        target: "binder", "search", or "both"
+        """
         t = self.themes["lunar" if self.dark_mode.get() else "solar"]
-        ps = int(self.s_rows.get()) * int(self.s_cols.get()); max_s = (len(self.display_search_data) + ps - 1) // ps
-        self.max_search_pages_var.set(f"Max: {max(1, max_s)}")
-        pb = int(self.b_rows.get()) * int(self.b_cols.get()); max_b = (max(len(self.display_owned_cards), pb * int(self.b_total_pages.get())) + pb - 1) // pb
-        self.max_binder_pages_var.set(f"Max: {max(1, max_b)}")
-        self.render_side(self.left_pane, self.display_owned_cards, self.binder_page, True, t, int(self.b_rows.get()), int(self.b_cols.get()))
-        self.render_side(self.right_pane, self.display_search_data, self.search_page, False, t, int(self.s_rows.get()), int(self.s_cols.get()))
+        
+        # --- Refresh Binder Side ---
+        if target in ["binder", "both"]:
+            try:
+                pb = int(self.b_rows.get()) * int(self.b_cols.get())
+                # Calculate max pages based on content or fixed total pages setting
+                max_b = (max(len(self.display_owned_cards), pb * int(self.b_total_pages.get())) + pb - 1) // pb
+                self.max_binder_pages_var.set(f"Max: {max(1, max_b)}")
+                
+                self.render_side(
+                    self.left_pane, 
+                    self.display_owned_cards, 
+                    self.binder_page, 
+                    True, 
+                    t, 
+                    int(self.b_rows.get()), 
+                    int(self.b_cols.get())
+                )
+            except ValueError:
+                pass # Handle cases where entry widgets might be empty temporarily
+
+        # --- Refresh Search Side ---
+        if target in ["search", "both"]:
+            try:
+                ps = int(self.s_rows.get()) * int(self.s_cols.get())
+                max_s = (len(self.display_search_data) + ps - 1) // ps
+                self.max_search_pages_var.set(f"Max: {max(1, max_s)}")
+                
+                self.render_side(
+                    self.right_pane, 
+                    self.display_search_data, 
+                    self.search_page, 
+                    False, 
+                    t, 
+                    int(self.s_rows.get()), 
+                    int(self.s_cols.get())
+                )
+            except ValueError:
+                pass
+
         self.update_progress()
 
     def quick_add(self, card): 
@@ -723,12 +871,12 @@ class TCGApp:
 
     def apply_filter(self):
         q = self.filter_var.get().lower(); self.display_search_data = [c for c in self.full_set_data if q in c['name'].lower()] if q else self.full_set_data.copy()
-        self.search_page = 1; self.refresh_view()
+        self.search_page = 1; self.refresh_view(target="search")
 
     def apply_binder_filter(self, reset_page=False):
         q = self.binder_filter_var.get().lower(); self.display_owned_cards = [c for c in self.owned_cards if q in c['name'].lower()] if q else self.owned_cards.copy()
         if reset_page: self.binder_page = 1; self.jump_binder_var.set("1")
-        self.refresh_view()
+        self.refresh_view(target="binder")
 
     def update_progress(self):
         if self.current_set_name:
