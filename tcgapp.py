@@ -1,8 +1,14 @@
 import os, json, requests, webbrowser, threading, urllib.parse, re, logging, sys
+import subprocess
 from logging.handlers import RotatingFileHandler
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from PIL import Image, ImageTk
+
+# --- SELF-TEST MODE ---
+# Used by the updater to verify the exe is valid before installing
+if "--self-test" in sys.argv:
+    sys.exit(0)
 
 # ==========================================
 # LOGGING CONFIGURATION
@@ -26,7 +32,7 @@ MAX_CACHE_FILES = 300 # Limit cache to 300 images to save disk space
 
 # --- UPDATE CONFIGURATION ---
 # CHANGE ON NEW RELEASES
-CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.1")
+CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.0")
 GITHUB_REPO = os.environ.get("TCG_GITHUB_REPO", "Mir-Khan/pokebinder")
 
 if not os.path.exists(CACHE_DIR): 
@@ -513,7 +519,7 @@ class TCGApp:
             self.perform_update(url)
 
     def perform_update(self, url):
-        """Downloads new exe, creates batch script, and restarts."""
+        """Downloads new exe and restarts."""
         try:
             # 1. Download the new executable
             self.status_var.set("Downloading update...")
@@ -523,6 +529,8 @@ class TCGApp:
             def _download():
                 try:
                     r = requests.get(url, stream=True)
+                    r.raise_for_status()
+                    
                     total_size = int(r.headers.get('content-length', 0))
                     downloaded = 0
                     
@@ -531,12 +539,18 @@ class TCGApp:
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
-                                # Optional: Update progress bar here if you want
                     
+                    if total_size != 0 and downloaded != total_size:
+                        raise Exception(f"Incomplete download: {downloaded}/{total_size} bytes")
+
+                    logger.info("Download complete. proceeding to update.")
                     self.root.after(0, self.finalize_update, new_exe_name)
+                    
                 except Exception as e:
                     logger.error(f"Download failed: {e}")
-                    self.root.after(0, lambda: messagebox.showerror("Update Failed", "Could not download the update."))
+                    self.root.after(0, lambda: messagebox.showerror("Update Failed", f"Error: {str(e)}"))
+                    try: os.remove(new_exe_name)
+                    except: pass
             
             threading.Thread(target=_download, daemon=True).start()
             
@@ -545,42 +559,55 @@ class TCGApp:
 
     def finalize_update(self, new_exe):
         """Creates the batch script and restarts."""
+        # Safety check: Prevent running update logic if not running as compiled EXE
+        if not getattr(sys, 'frozen', False):
+            logger.warning("Running from source code: Update skipped to prevent deleting python.exe")
+            messagebox.showinfo("Dev Mode", "Update downloaded, but restart skipped because you are running from source.")
+            return
+
         current_exe = os.path.basename(sys.executable)
         
-        # Create a batch script to swap files robustly
+        # Create a batch script that tries to DELETE the file directly.
+        # This is better than tasklist because it checks the specific file lock.
         bat_script = f"""
 @echo off
-:WAIT_LOOP
-tasklist | find /i "{current_exe}" >nul
-if %errorlevel% == 0 (
-    timeout /t 1 /nobreak >nul
-    goto WAIT_LOOP
-)
+title PokeBinder Updater
+echo Closing application...
 
-:DELETE_OLD
+REM Wait a generic 2 seconds for app to flush and close
+timeout /t 2 /nobreak >nul
+
+:TRY_DELETE
+echo Attempting to replace old version...
+REM Try to delete the file. If it fails (access denied), it means it's still running.
+del /f /q "{current_exe}" >nul 2>&1
+
 if exist "{current_exe}" (
-    del /f /q "{current_exe}"
-    if exist "{current_exe}" (
-        timeout /t 1 /nobreak >nul
-        goto DELETE_OLD
-    )
+    echo File is still locked. Retrying in 1 second...
+    timeout /t 1 /nobreak >nul
+    goto TRY_DELETE
 )
 
-:RENAME_NEW
-move /y "{new_exe}" "{current_exe}"
+echo Update found. Installing...
+move /y "{new_exe}" "{current_exe}" >nul
 
-:CLEANUP_ARTIFACTS
-if exist "python.exe" del /f /q "python.exe"
-
+echo Restarting PokeBinder...
+REM Give the OS/Antivirus a moment to release the new file handle
+timeout /t 2 /nobreak >nul
 start "" "{current_exe}"
-del "%~f0"
+
+REM Self-delete this script and exit
+del "%~f0" & exit
 """
         with open("update_installer.bat", "w") as f:
             f.write(bat_script)
             
         logger.info("Starting update script and closing app.")
         os.startfile("update_installer.bat")
-        self.root.quit()
+        
+        # Forcefully kill the process
+        self.root.destroy()
+        os._exit(0)
 
     # ==========================================
     # UI CONSTRUCTION
