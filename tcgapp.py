@@ -27,7 +27,7 @@ MAX_CACHE_FILES = 300 # Limit cache to 300 images to save disk space
 # --- UPDATE CONFIGURATION ---
 # CHANGE ON NEW RELEASES
 CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.0")
-GITHUB_REPO = os.environ.get("TCG_GITHUB_REPO", "Mir-Khan/ptcg-binder-maker")
+GITHUB_REPO = os.environ.get("TCG_GITHUB_REPO", "Mir-Khan/pokebinder")
 
 if not os.path.exists(CACHE_DIR): 
     os.makedirs(CACHE_DIR)
