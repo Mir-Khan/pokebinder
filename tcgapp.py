@@ -26,7 +26,7 @@ MAX_CACHE_FILES = 300 # Limit cache to 300 images to save disk space
 
 # --- UPDATE CONFIGURATION ---
 # CHANGE ON NEW RELEASES
-CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.0")
+CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.1")
 GITHUB_REPO = os.environ.get("TCG_GITHUB_REPO", "Mir-Khan/pokebinder")
 
 if not os.path.exists(CACHE_DIR): 
@@ -1035,8 +1035,44 @@ del "%~f0"
         self.refresh_current_binder_lists(); self.setup_side_menu(); self.refresh_view(target="binder")
 
     def create_binder(self):
-        n = simpledialog.askstring("New", "Name:")
-        if n and n not in self.data[self.current_user]["binders"]:
+        # Custom Dialog for New Binder
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Binder")
+        dialog.geometry("300x160")
+        dialog.configure(bg=t["bg"])
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Set Icon
+        icon_path = resource_path("app.ico")
+        if os.path.exists(icon_path):
+            dialog.iconbitmap(icon_path)
+            
+        # Center dialog
+        try:
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 150
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 80
+            dialog.geometry(f"+{x}+{y}")
+        except: pass
+
+        tk.Label(dialog, text="Binder Name:", font=("Segoe UI", 10, "bold"), bg=t["bg"], fg=t["text"]).pack(pady=(20, 5))
+        
+        name_var = tk.StringVar()
+        ent = tk.Entry(dialog, textvariable=name_var, font=("Segoe UI", 10), bg=t["input_bg"], fg=t["input_fg"], 
+                       insertbackground=t["input_fg"], relief="flat", highlightthickness=1, highlightbackground=t["frame_fg"])
+        ent.pack(fill="x", padx=30, pady=5, ipady=3)
+        ent.focus_set()
+
+        def submit(event=None):
+            n = name_var.get().strip()
+            if not n: return
+            
+            if n in self.data[self.current_user]["binders"]:
+                messagebox.showerror("Error", "Binder name already exists!", parent=dialog)
+                return
+
             logger.info(f"Creating new binder: {n}")
             self.data[self.current_user]["binders"][n] = []
             self.data[self.current_user]["order"].append(n)
@@ -1046,6 +1082,19 @@ del "%~f0"
             self.data[self.current_user]["binder_layouts"][n] = {"rows": 3, "cols": 3, "pages": 10}
             
             self.save_all_data(); self.select_binder(n)
+            dialog.destroy()
+
+        ent.bind("<Return>", submit)
+
+        btn_frame = tk.Frame(dialog, bg=t["bg"])
+        btn_frame.pack(pady=15)
+        
+        tk.Button(btn_frame, text="Create", command=submit, bg=t["btn_success"], fg="white", font=("Segoe UI", 9, "bold"), 
+                  relief="flat", padx=15).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, bg=t["btn_danger"], fg="white", font=("Segoe UI", 9), 
+                  relief="flat", padx=10).pack(side="left", padx=5)
+
+        self.root.wait_window(dialog)
 
     def delete_binder(self, name):
         if len(self.data[self.current_user]["binders"]) <= 1: return
@@ -1205,18 +1254,40 @@ del "%~f0"
                     self.status_var.set("No cards found")
                     return
 
+                # OPTIMIZATION: Load ALL set names once if not cached, 
+                # instead of making individual API requests for every card result.
+                if not hasattr(self, 'global_set_cache'):
+                    try:
+                        logger.debug("Fetching global set list for caching...")
+                        all_sets = requests.get("https://api.tcgdex.net/v2/en/sets").json()
+                        self.global_set_cache = {s['id']: s['name'] for s in all_sets}
+                    except: self.global_set_cache = {}
+
                 # Process results
                 cards = []
                 for c in res:
                     # TCGDex search results usually have id, name, image (base url)
                     if 'image' in c and c['image']:
-                        # Try to infer set name from ID if not present (e.g. swsh1-1 -> swsh1)
-                        s_id = c['id'].split('-')[0] if '-' in c['id'] else "Unknown"
+                        # Filter out TCG Pocket cards (identified by 'tcgp' in image path)
+                        if "/tcgp/" in c['image']:
+                            continue
+
+                        s_id = c.get('set', {}).get('id')
+                        if not s_id and '-' in c['id']:
+                            s_id = c['id'].split('-')[0]
+
+                        # Try to get existing set name, or lookup from global cache
+                        s_name = c.get('set', {}).get('name')
+                        
+                        # Use cached name if available and the API gave us a code/missing name
+                        if s_id and (not s_name or s_name == s_id):
+                            s_name = self.global_set_cache.get(s_id, s_id)
+
                         cards.append({
                             'id': c['id'],
                             'name': c['name'],
                             'image': f"{c['image']}/low.jpg",
-                            'set_name': c.get('set', {}).get('name', s_id.upper()), # Fallback
+                            'set_name': s_name,
                             'set_id': s_id
                         })
                 
