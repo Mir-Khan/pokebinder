@@ -6,6 +6,17 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+## 📸 Screenshots
+
+![Dark Mode Interface](screenshots/dark_mode.png)
+*Manage your collection in the sleek Lunar (Dark) theme.*
+
+![Light Mode Interface](screenshots/light_mode.png)
+*Switch to the Solar (Light) theme for a brighter look.*
+
+![Login System](screenshots/login.png)
+*Secure user profiles with password protection.*
+
 ## ✨ Key Features
 
 ### 📚 Virtual Binder Management
@@ -89,9 +100,9 @@ If you are building the app yourself, you can configure the update target:
 
 ### File Structure
 The app creates the following files in its directory:
-*   [tcg_data.json](http://_vscodecontentref_/0): Stores all user profiles and binder data. **Back this up!**
-*   [card_cache](http://_vscodecontentref_/1): Stores downloaded card images.
-*   [tcg_debug.log](http://_vscodecontentref_/2): Log file for troubleshooting.
+*   [tcg_data.json](http://_vscodecontentref_/1): Stores all user profiles and binder data. **Back this up!**
+*   [card_cache](http://_vscodecontentref_/2): Stores downloaded card images.
+*   [tcg_debug.log](http://_vscodecontentref_/3): Log file for troubleshooting.
 
 ---
 
