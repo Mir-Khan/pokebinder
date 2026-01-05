@@ -1,8 +1,25 @@
-/.env
-/my_collection.json
-/card_cache
-/imgs/*.png
+# Python
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+#Environment Files
+.env
+
+# Application Data (User specific)
 tcg_data.json
 tcg_debug.log
-/binders/*.json
-.vscode
+card_cache/
+binders/
+imgs/locked.png
+
+# PyInstaller Build Artifacts
+build/
+dist/
+*.spec
+
+# Auto-Update Temporary Files
+update_installer.bat
+PokeBinder_new.exe

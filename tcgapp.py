@@ -1,4 +1,5 @@
-import os, json, requests, webbrowser, threading, urllib.parse, re, logging
+import os, json, requests, webbrowser, threading, urllib.parse, re, logging, sys
+from logging.handlers import RotatingFileHandler
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from PIL import Image, ImageTk
@@ -10,7 +11,9 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("tcg_debug.log"),
+        # Limit log file to 2MB, keep 1 backup file. 
+        # This prevents the log from ballooning in size over time.
+        RotatingFileHandler("tcg_debug.log", maxBytes=2*1024*1024, backupCount=1),
         logging.StreamHandler()
     ]
 )
@@ -19,16 +22,47 @@ logger = logging.getLogger(__name__)
 # Data file for users and binders
 SAVE_FILE = "tcg_data.json"
 CACHE_DIR = "card_cache"
+MAX_CACHE_FILES = 300 # Limit cache to 300 images to save disk space
+
+# --- UPDATE CONFIGURATION ---
+# CHANGE ON NEW RELEASES
+CURRENT_VERSION = os.environ.get("TCG_APP_VERSION", "1.0.0")
+GITHUB_REPO = os.environ.get("TCG_GITHUB_REPO", "Mir-Khan/ptcg-binder-maker")
+
 if not os.path.exists(CACHE_DIR): 
     os.makedirs(CACHE_DIR)
     logger.info(f"Created cache directory: {CACHE_DIR}")
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 class TCGApp:
     def __init__(self, root):
         logger.info("Initializing TCGApp...")
+        
+        # --- Windows High DPI Fix (Makes it look good on Win 10/11) ---
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass # Fails gracefully on older Windows or non-Windows
+
         self.root = root
-        self.root.title("TCG Binder - Multi-User Edition")
-        self.root.geometry("1600x900") 
+        self.root.title("PokeBinder")
+         # --- Set Window Icon ---
+        # You must have a file named 'app.ico' in your project folder
+        icon_path = resource_path("app.ico")
+        if os.path.exists(icon_path):
+            self.root.iconbitmap(icon_path)
+
+        self.root.geometry("1600x900")
         
         # --- Drag and Drop State ---
         self.drag_data = {"card": None, "origin_idx": None, "is_binder": False, "widget": None}
@@ -60,7 +94,7 @@ class TCGApp:
                 "prog_100": "#2E7D32", "prog_75": "#43A047", "prog_50": "#F9A825", "prog_25": "#EF6C00", "prog_0": "#C62828"
             },
             "lunar": {
-                "bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#4B0082", "card_bg": "#16213E", 
+                "bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#BB86FC", "card_bg": "#16213E", 
                 "btn": "#3E4A89", "hl": "#FFD700", "owned": "#2E7D32", "text": "#FFFFFF", 
                 "menu": "#0F3460", "overflow": "#450000",
                 # New UI Elements
@@ -122,7 +156,26 @@ class TCGApp:
         # --- Events ---
         self.root.bind("<Configure>", lambda e: self.on_resize(e))
         self.root.after(100, self.switch_user)
+
+        # Start background cache cleanup
+        threading.Thread(target=self.cleanup_cache, daemon=True).start()
+
         logger.info("UI Setup complete.")
+    
+    def cleanup_cache(self):
+        """Deletes oldest files if cache exceeds MAX_CACHE_FILES"""
+        try:
+            files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR)]
+            if len(files) > MAX_CACHE_FILES:
+                # Sort by modification time (oldest first)
+                files.sort(key=os.path.getmtime)
+                # Delete excess files
+                for f in files[:-MAX_CACHE_FILES]:
+                    try: os.remove(f)
+                    except: pass
+                logger.info(f"Cache cleanup: Removed {len(files) - MAX_CACHE_FILES} old images.")
+        except Exception as e:
+            logger.error(f"Cache cleanup failed: {e}")
 
     # ==========================================
     # SCROLLING & RESIZE LOGIC
@@ -401,6 +454,9 @@ class TCGApp:
         if "order" not in user_data: user_data["order"] = list(user_data["binders"].keys())
         if "binder_layouts" not in user_data: user_data["binder_layouts"] = {}
         
+        # Initialize theme preference if missing
+        if "dark_mode" not in user_data: user_data["dark_mode"] = True
+
         if self.current_binder_name not in user_data["binders"]:
             self.current_binder_name = user_data["order"][0]
 
@@ -415,6 +471,97 @@ class TCGApp:
         self.b_rows.set(str(layout.get("rows", 3)))
         self.b_cols.set(str(layout.get("cols", 3)))
         self.b_total_pages.set(str(layout.get("pages", 10)))
+    
+    # ==========================================
+    # AUTO-UPDATER LOGIC
+    # ==========================================
+    def check_for_updates(self, silent=False):
+        """Checks GitHub for a newer release."""
+        if "your-repo-name" in GITHUB_REPO:
+            if not silent: messagebox.showinfo("Config Error", "Please configure GITHUB_REPO in the source code.")
+            return
+
+        logger.info("Checking for updates...")
+        def _check():
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    latest_tag = data['tag_name'].lstrip('v') # Remove 'v' if present
+                    
+                    # Simple version comparison
+                    if latest_tag != CURRENT_VERSION:
+                        # Find the .exe asset
+                        exe_url = next((a['browser_download_url'] for a in data['assets'] if a['name'].endswith('.exe')), None)
+                        
+                        if exe_url:
+                            self.root.after(0, lambda: self.prompt_update(latest_tag, exe_url, data['body']))
+                        elif not silent:
+                            self.root.after(0, lambda: messagebox.showinfo("Update", "New version detected, but no executable found."))
+                    elif not silent:
+                        self.root.after(0, lambda: messagebox.showinfo("Up to Date", f"You are running the latest version ({CURRENT_VERSION})."))
+            except Exception as e:
+                logger.error(f"Update check failed: {e}")
+                if not silent: self.root.after(0, lambda: messagebox.showerror("Error", "Failed to check for updates."))
+        
+        threading.Thread(target=_check, daemon=True).start()
+
+    def prompt_update(self, version, url, notes):
+        msg = f"A new version ({version}) is available!\n\nRelease Notes:\n{notes}\n\nUpdate now?"
+        if messagebox.askyesno("Update Available", msg):
+            self.perform_update(url)
+
+    def perform_update(self, url):
+        """Downloads new exe, creates batch script, and restarts."""
+        try:
+            # 1. Download the new executable
+            self.status_var.set("Downloading update...")
+            new_exe_name = "PokeBinder_new.exe"
+            
+            # Stream download to avoid freezing
+            def _download():
+                try:
+                    r = requests.get(url, stream=True)
+                    total_size = int(r.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(new_exe_name, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                # Optional: Update progress bar here if you want
+                    
+                    self.root.after(0, self.finalize_update, new_exe_name)
+                except Exception as e:
+                    logger.error(f"Download failed: {e}")
+                    self.root.after(0, lambda: messagebox.showerror("Update Failed", "Could not download the update."))
+            
+            threading.Thread(target=_download, daemon=True).start()
+            
+        except Exception as e:
+            logger.error(f"Update init failed: {e}")
+
+    def finalize_update(self, new_exe):
+        """Creates the batch script and restarts."""
+        current_exe = os.path.basename(sys.executable)
+        
+        # Create a batch script to swap files
+        bat_script = f"""
+@echo off
+timeout /t 2 /nobreak > NUL
+del "{current_exe}"
+move "{new_exe}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+"""
+        with open("update_installer.bat", "w") as f:
+            f.write(bat_script)
+            
+        logger.info("Starting update script and closing app.")
+        os.startfile("update_installer.bat")
+        self.root.quit()
 
     # ==========================================
     # UI CONSTRUCTION
@@ -599,6 +746,8 @@ class TCGApp:
         user_sec = tk.Frame(self.menu_frame, pady=10, bg=t["menu"])
         user_sec.pack(fill="x")
         tk.Label(user_sec, text=f"👤 {self.current_user}", font=("Segoe UI", 11, "bold"), bg=t["menu"], fg=t["text"]).pack()
+        tk.Button(user_sec, text=f"v{CURRENT_VERSION} (Check Updates)", command=lambda: self.check_for_updates(silent=False), 
+                  font=("Arial", 7), bg=t["menu"], fg=t["accent"], relief="flat", cursor="hand2").pack(pady=2)
         tk.Button(user_sec, text="Switch User", command=self.switch_user, font=("Arial", 8), bg="#555555", fg="white").pack(pady=5)
         ttk.Separator(self.menu_frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
         tk.Label(self.menu_frame, text="YOUR BINDERS", font=("Arial", 9, "bold"), bg=t["menu"], fg=t["text"]).pack(pady=5)
@@ -819,6 +968,11 @@ class TCGApp:
             except Exception as e: 
                 logger.error(f"Image download failed for {card['id']}: {e}")
                 return None
+        
+        # Update file timestamp to mark as "recently used"
+        try: os.utime(p, None)
+        except: pass
+
         try: 
             img = Image.open(p).resize((width, int(width*1.4)), Image.Resampling.LANCZOS)
             if dim:
@@ -910,20 +1064,87 @@ class TCGApp:
     def switch_user(self):
         logger.info("Opening Login Dialog")
         self.authenticated = False; self.refresh_view()
-        win = tk.Toplevel(self.root); win.title("Switch User"); win.geometry("350x400"); win.transient(self.root); win.grab_set()
-        u_list = list(self.data.keys()); u_var = tk.StringVar(value=self.current_user if self.current_user in u_list else (u_list[0] if u_list else ""))
-        ttk.Combobox(win, textvariable=u_var, values=u_list, state="readonly").pack(pady=5)
-        pw_ent = tk.Entry(win, show="*"); pw_ent.pack(pady=5)
-        def login():
+        
+        # Get current theme colors
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
+        
+        win = tk.Toplevel(self.root)
+        win.title("PokeBinder Login")
+        
+        # Apply App Icon to Login Window
+        icon_path = resource_path("app.ico")
+        if os.path.exists(icon_path):
+            win.iconbitmap(icon_path)
+
+        win.geometry("340x450")
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(bg=t["bg"])
+        
+        # Center window relative to main app
+        try:
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 170
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 225
+            win.geometry(f"+{x}+{y}")
+        except: pass
+
+        # --- Header Section ---
+        tk.Label(win, text="PokeBinder", font=("Segoe UI", 22, "bold"), bg=t["bg"], fg=t["accent"]).pack(pady=(40, 5))
+        tk.Label(win, text="User Login", font=("Arial", 10), bg=t["bg"], fg=t["text"]).pack(pady=(0, 30))
+
+        # --- Form Container ---
+        form = tk.Frame(win, bg=t["bg"])
+        form.pack(fill="x", padx=40)
+
+        # User Selection
+        tk.Label(form, text="Select Profile", font=("Arial", 8, "bold"), bg=t["bg"], fg=t["text"]).pack(anchor="w")
+        
+        u_list = list(self.data.keys())
+        u_var = tk.StringVar(value=self.current_user if self.current_user in u_list else (u_list[0] if u_list else ""))
+        
+        cb = ttk.Combobox(form, textvariable=u_var, values=u_list, state="readonly", font=("Segoe UI", 10))
+        cb.pack(fill="x", pady=(2, 15), ipady=3)
+
+        # Password Entry
+        tk.Label(form, text="Password", font=("Arial", 8, "bold"), bg=t["bg"], fg=t["text"]).pack(anchor="w")
+        
+        pw_ent = tk.Entry(form, show="*", bg=t["input_bg"], fg=t["input_fg"], 
+                          insertbackground=t["input_fg"], relief="flat", 
+                          highlightthickness=1, highlightbackground=t["frame_fg"], font=("Segoe UI", 10))
+        pw_ent.pack(fill="x", pady=(2, 5), ipady=5)
+        
+        # Error Message Label
+        err_lbl = tk.Label(form, text="", font=("Arial", 9), bg=t["bg"], fg=t["btn_danger"])
+        err_lbl.pack(pady=(0, 15))
+
+        def login(event=None):
             u = u_var.get()
             if u in self.data and self.data[u].get("pw") == pw_ent.get():
                 logger.info(f"User {u} authenticated successfully.")
                 self.authenticated = True; self.current_user = u; self.binder_page = 1; self.ensure_user_exists()
+                
+                # Load saved theme preference
+                saved_theme = self.data[u].get("dark_mode", True)
+                self.dark_mode.set(saved_theme)
+
                 self.refresh_current_binder_lists(); self.setup_side_menu(); self.apply_theme(); self.refresh_view(); win.destroy()
             else:
                 logger.warning(f"Failed login attempt for user: {u}")
-        tk.Button(win, text="Login", bg="#3E4A89", fg="white", width=15, command=login).pack(pady=10)
-        tk.Button(win, text="Create Profile", bg="#2E7D32", fg="white", width=15, command=lambda: self.create_profile_dialog(win)).pack()
+                err_lbl.config(text="Incorrect password")
+                pw_ent.delete(0, "end")
+                pw_ent.config(highlightbackground=t["btn_danger"])
+
+        pw_ent.bind("<Return>", login)
+        pw_ent.bind("<FocusIn>", lambda e: pw_ent.config(highlightbackground=t["accent"]))
+
+        # --- Buttons ---
+        tk.Button(form, text="Login", command=login, bg=t["btn_info"], fg="white", 
+                  font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
+                  activebackground=t["hl"], activeforeground=t["bg"]).pack(fill="x", pady=5, ipady=3)
+        
+        tk.Button(form, text="Create New Profile", command=lambda: self.create_profile_dialog(win), 
+                  bg=t["btn_success"], fg="white", font=("Segoe UI", 9), relief="flat", cursor="hand2",
+                  activebackground=t["hl"], activeforeground=t["bg"]).pack(fill="x", pady=5, ipady=2)
 
     def create_profile_dialog(self, win):
         nu = simpledialog.askstring("New User", "Username:")
@@ -1017,6 +1238,11 @@ class TCGApp:
     # VIEW UPDATES & FILTERING
     # ==========================================
     def apply_theme(self):
+        # Save theme preference if user is logged in
+        if self.authenticated and self.current_user in self.data:
+            self.data[self.current_user]["dark_mode"] = self.dark_mode.get()
+            self.save_all_data()
+
         t = self.themes["lunar" if self.dark_mode.get() else "solar"]
         self.root.configure(bg=t["bg"]); self.menu_frame.configure(bg=t["menu"]); self.top.configure(bg=t["bg"])
         
