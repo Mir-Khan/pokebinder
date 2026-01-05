@@ -48,13 +48,33 @@ class TCGApp:
         # --- UI Variables ---
         self.dark_mode = tk.BooleanVar(value=True)
         self.themes = {
-            "solar": {"bg": "#FFFBE6", "fg": "#5C4033", "accent": "#FFA500", "card_bg": "#FFFFFF", "btn": "#FFD700", "hl": "#FFD700", "owned": "#4CAF50", "text": "#000000", "menu": "#F0EAD6", "overflow": "#8B4513"},
-            "lunar": {"bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#4B0082", "card_bg": "#16213E", "btn": "#3E4A89", "hl": "#FFD700", "owned": "#2E7D32", "text": "#FFFFFF", "menu": "#0F3460", "overflow": "#450000"}
+            "solar": {
+                "bg": "#FFFBE6", "fg": "#5C4033", "accent": "#FFA500", "card_bg": "#FFFFFF", 
+                "btn": "#FFD700", "hl": "#FFD700", "owned": "#4CAF50", "text": "#000000", 
+                "menu": "#F0EAD6", "overflow": "#8B4513",
+                # New UI Elements
+                "input_bg": "#FFFFFF", "input_fg": "#000000", "frame_fg": "#8D6E63",
+                "btn_text": "#FFFFFF", "btn_success": "#81C784", "btn_danger": "#E57373", 
+                "btn_info": "#64B5F6", "btn_neutral": "#B0BEC5",
+                # Progress Colors (Darker for light bg)
+                "prog_100": "#2E7D32", "prog_75": "#43A047", "prog_50": "#F9A825", "prog_25": "#EF6C00", "prog_0": "#C62828"
+            },
+            "lunar": {
+                "bg": "#1A1A2E", "fg": "#E0E0E0", "accent": "#4B0082", "card_bg": "#16213E", 
+                "btn": "#3E4A89", "hl": "#FFD700", "owned": "#2E7D32", "text": "#FFFFFF", 
+                "menu": "#0F3460", "overflow": "#450000",
+                # New UI Elements
+                "input_bg": "#2E2E4E", "input_fg": "#FFFFFF", "frame_fg": "#A0A0A0",
+                "btn_text": "#FFFFFF", "btn_success": "#2E7D32", "btn_danger": "#C62828", 
+                "btn_info": "#1565C0", "btn_neutral": "#455A64",
+                # Progress Colors (Lighter for dark bg)
+                "prog_100": "#69F0AE", "prog_75": "#66BB6A", "prog_50": "#FFCA28", "prog_25": "#FFA726", "prog_0": "#EF5350"
+            }
         }
         
         self.b_rows, self.b_cols = tk.StringVar(value="3"), tk.StringVar(value="3")
         self.b_total_pages = tk.StringVar(value="10")
-        self.s_rows, self.s_cols = tk.StringVar(value="4"), tk.StringVar(value="4")
+        self.s_rows, self.s_cols = tk.StringVar(value="3"), tk.StringVar(value="3")
         
         self.jump_search_var = tk.StringVar(value="1")
         self.jump_binder_var = tk.StringVar(value="1")
@@ -85,6 +105,8 @@ class TCGApp:
         
         self.status_var = tk.StringVar(value="Ready")
         self.progress_text = tk.StringVar(value="No set loaded")
+        self.progress_scroll_var = tk.StringVar(value="No set loaded") # UI Display variable
+        self._ticker_job = None # Handle for the scrolling animation
         self.binder_page, self.search_page = 1, 1
         
         # --- Card Data Containers ---
@@ -131,16 +153,23 @@ class TCGApp:
         try:
             rows = int(self.b_rows.get())
             cols = int(self.b_cols.get())
-            if rows <= 0 or cols <= 0:
-                raise ValueError("Rows and columns must be positive integers.")
+            pages = int(self.b_total_pages.get())
+            if rows <= 0 or cols <= 0 or pages <= 0:
+                raise ValueError("Rows, columns, and pages must be positive integers.")
             
-            logger.info(f"Applying binder grid: {rows} rows x {cols} cols")
+            logger.info(f"Applying binder grid: {rows} rows x {cols} cols x {pages} pages")
+            
+            # Save layout configuration
+            user_data = self.data[self.current_user]
+            if "binder_layouts" not in user_data: user_data["binder_layouts"] = {}
+            user_data["binder_layouts"][self.current_binder_name] = {"rows": rows, "cols": cols, "pages": pages}
+            self.save_all_data()
             
             # Re-render the current page with the updated grid
             self.refresh_view(target="binder")
         except ValueError as e:
             logger.error(f"Invalid grid size: {e}")
-            messagebox.showerror("Invalid Input", "Rows and columns must be positive integers.")
+            messagebox.showerror("Invalid Input", "Rows, columns, and pages must be positive integers.")
 
 
 
@@ -148,6 +177,44 @@ class TCGApp:
         logger.info(f"Sorting binder: {self.current_binder_name}")
         self.owned_cards = [c for c in self.owned_cards if c.get('id') != 'empty']
         self.owned_cards.sort(key=lambda x: x['name'].lower())
+        self.data[self.current_user]["binders"][self.current_binder_name] = self.owned_cards
+        self.save_all_data()
+        self.apply_binder_filter(reset_page=False)
+    
+    def sort_binder_by_number(self):
+        logger.info(f"Sorting binder by number: {self.current_binder_name}")
+        
+        # 1. Ensure card_number exists for all cards (Data Migration)
+        for card in self.owned_cards:
+            if card.get('id') != 'empty' and 'card_number' not in card:
+                try:
+                    # Extract from ID (e.g. "me02-129" -> "129")
+                    if '-' in card['id']:
+                        card['card_number'] = card['id'].split('-')[-1]
+                    # Fallback: Extract from Image URL
+                    elif 'image' in card:
+                        match = re.search(r'/([^/]+)/low\.jpg', card['image'])
+                        if match: card['card_number'] = match.group(1)
+                    
+                    if 'card_number' not in card: card['card_number'] = "0"
+                except:
+                    card['card_number'] = "0"
+
+        # 2. Filter out empty slots
+        self.owned_cards = [c for c in self.owned_cards if c.get('id') != 'empty']
+        
+        # 3. Sort logic (handles "1", "2", "10" correctly instead of "1", "10", "2")
+        def get_num(c):
+            try: 
+                # Extract digits to handle variants like "12a"
+                s = str(c.get('card_number', '0'))
+                num_part = "".join(filter(str.isdigit, s))
+                return int(num_part) if num_part else 9999
+            except: return 9999
+
+        self.owned_cards.sort(key=get_num)
+        
+        # 4. Update and Save to Disk
         self.data[self.current_user]["binders"][self.current_binder_name] = self.owned_cards
         self.save_all_data()
         self.apply_binder_filter(reset_page=False)
@@ -289,7 +356,6 @@ class TCGApp:
 
     def execute_move(self, card, origin_idx, target_idx, was_in_binder):
         logger.debug(f"Executing move: {card['name']} from {origin_idx} to {target_idx}")
-        per_page = int(self.b_rows.get()) * int(self.b_cols.get())
         
         while len(self.owned_cards) <= target_idx:
             self.owned_cards.append({"name": "Empty Slot", "id": "empty", "image": ""})
@@ -328,11 +394,13 @@ class TCGApp:
 
     def ensure_user_exists(self):
         if not self.data:
-            self.data["DefaultUser"] = {"pw": "1234", "binders": {"Main Binder": []}, "order": ["Main Binder"]}
+            self.data["DefaultUser"] = {"pw": "1234", "binders": {"Main Binder": []}, "order": ["Main Binder"], "binder_layouts": {"Main Binder": {"rows": 3, "cols": 3, "pages": 10}}}
         if self.current_user not in self.data:
             self.current_user = list(self.data.keys())[0]
         user_data = self.data[self.current_user]
         if "order" not in user_data: user_data["order"] = list(user_data["binders"].keys())
+        if "binder_layouts" not in user_data: user_data["binder_layouts"] = {}
+        
         if self.current_binder_name not in user_data["binders"]:
             self.current_binder_name = user_data["order"][0]
 
@@ -340,32 +408,49 @@ class TCGApp:
         self.owned_cards = self.data[self.current_user]["binders"][self.current_binder_name]
         self.display_owned_cards = self.owned_cards.copy()
         self.binder_title_var.set(self.current_binder_name.upper())
+        
+        # Load layout settings for this binder
+        layouts = self.data[self.current_user].get("binder_layouts", {})
+        layout = layouts.get(self.current_binder_name, {"rows": 3, "cols": 3, "pages": 10})
+        self.b_rows.set(str(layout.get("rows", 3)))
+        self.b_cols.set(str(layout.get("cols", 3)))
+        self.b_total_pages.set(str(layout.get("pages", 10)))
 
     # ==========================================
     # UI CONSTRUCTION
     # ==========================================
     def setup_ui(self):
-        self.main_container = tk.Frame(self.root)
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
+
+        self.main_container = tk.Frame(self.root, bg=t["bg"])
         self.main_container.pack(fill="both", expand=True)
 
-        self.menu_frame = tk.Frame(self.main_container, width=220)
+        self.menu_frame = tk.Frame(self.main_container, width=220, bg=t["menu"])
         self.menu_frame.pack(side="left", fill="y")
         self.setup_side_menu()
 
-        self.content_frame = tk.Frame(self.main_container)
+        self.content_frame = tk.Frame(self.main_container, bg=t["bg"])
         self.content_frame.pack(side="right", fill="both", expand=True)
 
-        self.top = tk.Frame(self.content_frame, pady=5)
+        self.top = tk.Frame(self.content_frame, pady=5, bg=t["bg"])
         self.top.pack(fill="x", side="top")
         
-        tk.Button(self.top, text="☰", font=("Arial", 11, "bold"), command=self.toggle_menu, relief="flat").pack(side="left", padx=10)
-        tk.Checkbutton(self.top, text="🌙 Theme", variable=self.dark_mode, command=self.apply_theme, indicatoron=False).pack(side="right", padx=10)
-        tk.Label(self.top, textvariable=self.status_var, font=("Arial", 9, "italic")).pack(side="right", padx=20)
+        self.menu_btn = tk.Button(self.top, text="☰", font=("Arial", 11, "bold"), command=self.toggle_menu, 
+                                  relief="flat", bg=t["btn"], fg=t["btn_text"], activebackground=t["hl"], activeforeground=t["bg"])
+        self.menu_btn.pack(side="left", padx=10)
+
+        self.theme_btn = tk.Checkbutton(self.top, text="🌙 Theme", variable=self.dark_mode, command=self.apply_theme, 
+                                        indicatoron=False, bg=t["btn"], fg=t["text"], selectcolor=t["hl"], activebackground=t["hl"])
+        self.theme_btn.pack(side="right", padx=10)
+
+        self.status_lbl = tk.Label(self.top, textvariable=self.status_var, font=("Arial", 9, "italic"), bg=t["bg"], fg=t["text"])
+        self.status_lbl.pack(side="right", padx=20)
         
-        self.paned = tk.PanedWindow(self.content_frame, orient="horizontal", sashwidth=4, bg="#333333"); self.paned.pack(fill="both", expand=True)
+        self.paned = tk.PanedWindow(self.content_frame, orient="horizontal", sashwidth=4, bg=t["bg"], sashrelief="flat")
+        self.paned.pack(fill="both", expand=True)
         
         self.left_pane = self.create_scrollable_pane(self.paned, self.binder_title_var, "binder")
-        self.right_pane = self.create_scrollable_pane(self.paned, tk.StringVar(value="Filter"), "search")
+        self.right_pane = self.create_scrollable_pane(self.paned, tk.StringVar(value="Filter search"), "search")
         
         self.setup_binder_header()
         self.setup_search_header()
@@ -373,34 +458,135 @@ class TCGApp:
     def setup_binder_header(self):
         h = self.left_pane['header_tools']
         for w in h.winfo_children(): w.destroy()
-        g_f = tk.Frame(h); g_f.pack(side="left", padx=5)
-        tk.Label(g_f, text="Binder Grid Size:", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.b_rows).pack(side="left")
-        tk.Label(g_f, text="x", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.b_cols).pack(side="left")
-        tk.Label(g_f, text=" Pgs:", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=3, textvariable=self.b_total_pages).pack(side="left")
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
         
-        tk.Button(h, text="Apply Grid", command=self.apply_binder_grid, bg="#2bb532", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
-        tk.Button(h, text="Sort", command=self.sort_binder, bg="#555", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
-        tk.Button(h, text="Empty", command=self.clear_binder, bg="#8B0000", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
-        tk.Button(h, text="+Full", command=self.add_full_set_to_binder, bg="#2E7D32", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
-        tk.Button(h, text="Set", command=self.refresh_view(target="binder"), bg="#3E4A89", fg="white", font=("Arial", 8), padx=5).pack(side="left", padx=2)
+        # Helper functions for consistent styling
+        def style_frame(parent, text):
+            f = tk.LabelFrame(parent, text=text, font=("Segoe UI", 8, "bold"), padx=5, pady=2, 
+                              bg=t["bg"], fg=t["frame_fg"], relief="flat", bd=1)
+            f.pack(side="left", padx=5, pady=2, fill="y")
+            return f
+
+        def style_entry(parent, var, width):
+            e = tk.Entry(parent, width=width, textvariable=var, bg=t["input_bg"], fg=t["input_fg"], 
+                         insertbackground=t["input_fg"], relief="flat", highlightthickness=1, highlightbackground=t["frame_fg"])
+            e.pack(side="left", padx=2, ipady=2)
+            return e
+
+        def style_btn(parent, text, cmd, bg_col):
+            b = tk.Button(parent, text=text, command=cmd, bg=bg_col, fg=t["btn_text"], 
+                          font=("Arial", 8, "bold"), relief="flat", activebackground=t["hl"], activeforeground=t["bg"], padx=8)
+            b.pack(side="left", padx=2, pady=1)
+            return b
+        
+        # --- Layout Controls Group ---
+        layout_frame = style_frame(h, "Grid Layout")
+        
+        tk.Label(layout_frame, text="Rows:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left")
+        style_entry(layout_frame, self.b_rows, 3)
+        tk.Label(layout_frame, text="Cols:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left")
+        style_entry(layout_frame, self.b_cols, 3)
+        tk.Label(layout_frame, text="Pages:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left", padx=(5, 2))
+        style_entry(layout_frame, self.b_total_pages, 4)
+        
+        style_btn(layout_frame, "Apply", self.apply_binder_grid, t["btn_success"])
+
+        # --- Binder Actions Group ---
+        action_frame = style_frame(h, "Actions")
+        
+        style_btn(action_frame, "Sort A-Z", self.sort_binder, t["btn_neutral"])
+        style_btn(action_frame, "Sort #", self.sort_binder_by_number, t["btn_neutral"])
+        style_btn(action_frame, "Clear All", self.clear_binder, t["btn_danger"])
+        style_btn(action_frame, "+ Add Loaded Set", self.add_full_set_to_binder, t["btn_success"])
 
     def setup_search_header(self):
+        # Preserve values during theme switch
+        # Check against placeholders to avoid saving them as actual values
+        raw_set = self.set_entry.get() if hasattr(self, 'set_entry') and self.set_entry.winfo_exists() else ""
+        current_set_val = raw_set if raw_set != "Name of set here..." else ""
+
+        raw_search = self.card_search_entry.get() if hasattr(self, 'card_search_entry') and self.card_search_entry.winfo_exists() else ""
+        current_search_val = raw_search if raw_search != "Card name..." else ""
+
         h = self.right_pane['header_tools']
         for w in h.winfo_children(): w.destroy()
-        g_f = tk.Frame(h); g_f.pack(side="left", padx=5)
-        tk.Label(g_f, text="Grid:", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.s_rows).pack(side="left")
-        tk.Label(g_f, text="x", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.s_cols).pack(side="left")
-        tk.Button(g_f, text="Set", command=self.refresh_view(target="binder"), font=("Arial", 8), padx=3).pack(side="left", padx=2)
-        l_f = tk.Frame(h); l_f.pack(side="left", padx=5)
-        self.set_entry = ttk.Entry(l_f, width=12); self.set_entry.insert(0, "Surging Sparks"); self.set_entry.pack(side="left")
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
+
+        # Helper functions (reused logic)
+        def style_frame(parent, text):
+            f = tk.LabelFrame(parent, text=text, font=("Segoe UI", 8, "bold"), padx=5, pady=2, 
+                              bg=t["bg"], fg=t["frame_fg"], relief="flat", bd=1)
+            f.pack(side="left", padx=5, pady=2, fill="y")
+            return f
+
+        def style_entry(parent, width, var=None, placeholder=None):
+            e = tk.Entry(parent, width=width, textvariable=var, bg=t["input_bg"], fg=t["input_fg"], 
+                         insertbackground=t["input_fg"], relief="flat", highlightthickness=1, highlightbackground=t["frame_fg"])
+            e.pack(side="left", padx=2, ipady=2)
+            
+            if placeholder and not var:
+                def on_focus_in(event):
+                    if e.get() == placeholder:
+                        e.delete(0, "end")
+                        e.config(fg=t["input_fg"])
+                
+                def on_focus_out(event):
+                    if not e.get():
+                        e.insert(0, placeholder)
+                        e.config(fg=t["frame_fg"])
+                
+                e.bind("<FocusIn>", on_focus_in)
+                e.bind("<FocusOut>", on_focus_out)
+                
+                # Initialize with placeholder
+                e.insert(0, placeholder)
+                e.config(fg=t["frame_fg"])
+            
+            return e
+
+        def style_btn(parent, text, cmd, bg_col):
+            b = tk.Button(parent, text=text, command=cmd, bg=bg_col, fg=t["btn_text"], 
+                          font=("Arial", 8, "bold"), relief="flat", activebackground=t["hl"], activeforeground=t["bg"], padx=8)
+            b.pack(side="left", padx=2, pady=1)
+            return b
+        
+        # --- Search Grid Group ---
+        view_frame = style_frame(h, "View")
+        
+        tk.Label(view_frame, text="Rows:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left")
+        style_entry(view_frame, 3, self.s_rows)
+        tk.Label(view_frame, text="Columns:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left")
+        style_entry(view_frame, 3, self.s_cols)
+        style_btn(view_frame, "Set Search Grid", lambda: self.refresh_view(target="search"), t["btn_neutral"])
+
+        # --- Set Loader Group ---
+        load_frame = style_frame(h, "Load Set (TCGDex)")
+        
+        self.set_entry = style_entry(load_frame, 18, placeholder="Name of set here...")
+        if current_set_val:
+            self.set_entry.delete(0, "end")
+            self.set_entry.insert(0, current_set_val)
+            self.set_entry.config(fg=t["input_fg"])
+            
         self.set_entry.bind("<Return>", self.handle_load)
-        tk.Button(l_f, text="Load", command=self.handle_load, bg="#3E4A89", fg="white", font=("Arial", 8)).pack(side="left", padx=2)
-        tk.Label(h, textvariable=self.progress_text, font=("Arial", 8, "bold"), fg="#4CAF50").pack(side="right", padx=10)
+        style_btn(load_frame, "Load Set", self.handle_load, t["btn_info"])
+
+        # --- Card Search Group ---
+        find_frame = style_frame(h, "Find Card")
+        
+        self.card_search_entry = style_entry(find_frame, 15, placeholder="Card name...")
+        if current_search_val:
+            self.card_search_entry.delete(0, "end")
+            self.card_search_entry.insert(0, current_search_val)
+            self.card_search_entry.config(fg=t["input_fg"])
+            
+        self.card_search_entry.bind("<Return>", self.handle_card_search)
+        style_btn(find_frame, "Search", self.handle_card_search, t["btn_info"])
+
+         # --- Status ---
+        # Use progress_scroll_var and fixed width to support scrolling text
+        self.progress_label = tk.Label(h, textvariable=self.progress_scroll_var, font=("Segoe UI", 9, "bold"), fg=t["owned"], bg=t["bg"], width=30, anchor="e")
+        self.progress_label.pack(side="right", padx=10)
 
     def toggle_menu(self):
         if self.menu_visible: self.menu_frame.pack_forget()
@@ -425,25 +611,44 @@ class TCGApp:
         tk.Button(self.menu_frame, text="+ Create New Binder", command=self.create_binder, bg="#2E7D32", fg="white", font=("Arial", 9, "bold")).pack(fill="x", padx=10, pady=(5, 20))
 
     def create_scrollable_pane(self, parent, title_var, type_name):
-        frame = tk.Frame(parent); parent.add(frame, stretch="always")
-        header = tk.Frame(frame); header.pack(fill="x", pady=2)
-        tk.Label(header, textvariable=title_var, font=('Segoe UI', 10, 'bold')).pack(side="left", padx=10)
-        ttk.Entry(header, width=10, textvariable=self.binder_filter_var if type_name == "binder" else self.filter_var).pack(side="left", padx=2)
+        t = self.themes["lunar" if self.dark_mode.get() else "solar"]
         
-        nav = tk.Frame(header); nav.pack(side="right", padx=10)
-        tk.Label(nav, textvariable=self.max_binder_pages_var if type_name == "binder" else self.max_search_pages_var, font=("Arial", 8)).pack(side="left", padx=5)
-        tk.Button(nav, text="|<<", command=lambda: self.go_to_first(type_name), font=("Arial", 8)).pack(side="left", padx=1)
-        tk.Button(nav, text="<", command=lambda: self.change_page(type_name, -1), font=("Arial", 8)).pack(side="left", padx=1)
-        ent = tk.Entry(nav, width=3, textvariable=self.jump_binder_var if type_name == "binder" else self.jump_search_var)
+        frame = tk.Frame(parent, bg=t["bg"]); parent.add(frame, stretch="always")
+        header = tk.Frame(frame, bg=t["bg"]); header.pack(fill="x", pady=2)
+        
+        tk.Label(header, textvariable=title_var, font=('Segoe UI', 10, 'bold'), bg=t["bg"], fg=t["text"]).pack(side="left", padx=10)
+        
+        # Filter Entry with Label
+        if type_name == "binder":
+            tk.Label(header, text="Filter Binder:", font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left", padx=(10, 2))
+            
+        tk.Entry(header, width=15 if type_name == "binder" else 10, textvariable=self.binder_filter_var if type_name == "binder" else self.filter_var,
+                 bg=t["input_bg"], fg=t["input_fg"], insertbackground=t["input_fg"], 
+                 relief="flat", highlightthickness=1, highlightbackground=t["frame_fg"]).pack(side="left", padx=2)
+        
+        nav = tk.Frame(header, bg=t["bg"]); nav.pack(side="right", padx=10)
+        
+        tk.Label(nav, textvariable=self.max_binder_pages_var if type_name == "binder" else self.max_search_pages_var, 
+                 font=("Arial", 8), bg=t["bg"], fg=t["text"]).pack(side="left", padx=5)
+        
+        btn_args = {"bg": t["btn"], "fg": t["btn_text"], "activebackground": t["hl"], "activeforeground": t["bg"], "relief": "flat", "font": ("Arial", 8)}
+        
+        tk.Button(nav, text="|<<", command=lambda: self.go_to_first(type_name), **btn_args).pack(side="left", padx=1)
+        tk.Button(nav, text="<", command=lambda: self.change_page(type_name, -1), **btn_args).pack(side="left", padx=1)
+        
+        ent = tk.Entry(nav, width=3, textvariable=self.jump_binder_var if type_name == "binder" else self.jump_search_var,
+                       bg=t["input_bg"], fg=t["input_fg"], insertbackground=t["input_fg"], 
+                       relief="flat", highlightthickness=1, highlightbackground=t["frame_fg"])
         ent.pack(side="left", padx=2); ent.bind("<Return>", lambda e: self.jump_to_page(type_name, e))
-        tk.Button(nav, text=">", command=lambda: self.change_page(type_name, 1), font=("Arial", 8)).pack(side="left", padx=1)
-        tk.Button(nav, text=">>|", command=lambda: self.go_to_last(type_name), font=("Arial", 8)).pack(side="left", padx=1)
         
-        tools_row = tk.Frame(frame); tools_row.pack(fill="x", pady=2)
-        container = tk.Frame(frame); container.pack(fill="both", expand=True)
-        canvas = tk.Canvas(container, highlightthickness=0)
+        tk.Button(nav, text=">", command=lambda: self.change_page(type_name, 1), **btn_args).pack(side="left", padx=1)
+        tk.Button(nav, text=">>|", command=lambda: self.go_to_last(type_name), **btn_args).pack(side="left", padx=1)
+        
+        tools_row = tk.Frame(frame, bg=t["bg"]); tools_row.pack(fill="x", pady=2)
+        container = tk.Frame(frame, bg=t["bg"]); container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(container, highlightthickness=0, bg=t["bg"])
         v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        grid = tk.Frame(canvas); canvas.create_window((0, 0), window=grid, anchor="nw")
+        grid = tk.Frame(canvas, bg=t["bg"]); canvas.create_window((0, 0), window=grid, anchor="nw")
         canvas.configure(yscrollcommand=v_scroll.set)
         canvas.pack(side="left", fill="both", expand=True); v_scroll.pack(side="right", fill="y")
         return {"grid": grid, "canvas": canvas, "frame": frame, "header": header, "header_tools": tools_row, "container": container}
@@ -452,6 +657,24 @@ class TCGApp:
     # RENDERING & IMAGE CACHING
     # ==========================================
     def render_side(self, pane, data, page, is_binder, t, rows, cols):
+        # logger.info(f"This is the data being rendered: {data}")
+        
+        # Capture card number for sorting/logic
+        for card in data:
+            if card.get('id') != 'empty' and 'card_number' not in card:
+                try:
+                    # Extract from ID (e.g. "me02-129" -> "129")
+                    if '-' in card['id']:
+                        card['card_number'] = card['id'].split('-')[-1]
+                    # Fallback: Extract from Image URL
+                    elif 'image' in card:
+                        match = re.search(r'/([^/]+)/low\.jpg', card['image'])
+                        if match: card['card_number'] = match.group(1)
+                    
+                    if 'card_number' not in card: card['card_number'] = "0"
+                except:
+                    card['card_number'] = "0"
+
         for w in pane['grid'].winfo_children(): w.destroy()
         if is_binder and not self.authenticated:
             lock_path = os.path.join("img", "locked.png")
@@ -499,9 +722,16 @@ class TCGApp:
 
             if idx < len(data) and data[idx].get('id') != 'empty':
                 card = data[idx]
+                logger.info(f"Rendering card at index {idx}: {card['name']} with data {card}")
+                
+                # Format: Set Name, Card # - Card Name
+                s_name = card.get('set_name', 'Unknown Set')
+                c_num = card.get('card_number', '?')
+                disp_text = f"{s_name}, #{c_num} - {card['name']}"
+
                 tk.Label(
                     slot,
-                    text=card['name'],
+                    text=disp_text,
                     bg=t["card_bg"],
                     fg=t["text"],
                     font=('Arial', 7, 'bold'),
@@ -648,20 +878,32 @@ class TCGApp:
     def select_binder(self, name):
         logger.info(f"Switching binder to: {name}")
         self.current_binder_name = name; self.binder_page = 1; self.jump_binder_var.set("1")
-        self.refresh_current_binder_lists(); self.setup_side_menu(); self.refresh_view()
+        self.refresh_current_binder_lists(); self.setup_side_menu(); self.refresh_view(target="binder")
 
     def create_binder(self):
         n = simpledialog.askstring("New", "Name:")
         if n and n not in self.data[self.current_user]["binders"]:
             logger.info(f"Creating new binder: {n}")
-            self.data[self.current_user]["binders"][n] = []; self.data[self.current_user]["order"].append(n)
+            self.data[self.current_user]["binders"][n] = []
+            self.data[self.current_user]["order"].append(n)
+            
+            # Initialize default layout
+            if "binder_layouts" not in self.data[self.current_user]: self.data[self.current_user]["binder_layouts"] = {}
+            self.data[self.current_user]["binder_layouts"][n] = {"rows": 3, "cols": 3, "pages": 10}
+            
             self.save_all_data(); self.select_binder(n)
 
     def delete_binder(self, name):
         if len(self.data[self.current_user]["binders"]) <= 1: return
         if messagebox.askyesno("Confirm", f"Delete {name}?"):
             logger.warning(f"Deleting binder: {name}")
-            del self.data[self.current_user]["binders"][name]; self.data[self.current_user]["order"].remove(name)
+            del self.data[self.current_user]["binders"][name]
+            self.data[self.current_user]["order"].remove(name)
+            
+            # Remove layout info
+            if "binder_layouts" in self.data[self.current_user] and name in self.data[self.current_user]["binder_layouts"]:
+                del self.data[self.current_user]["binder_layouts"][name]
+                
             if self.current_binder_name == name: self.current_binder_name = self.data[self.current_user]["order"][0]
             self.save_all_data(); self.select_binder(self.current_binder_name)
 
@@ -688,41 +930,17 @@ class TCGApp:
         if nu and nu not in self.data:
             np = simpledialog.askstring("Pass", "Password:", show="*")
             logger.info(f"Creating new user profile: {nu}")
-            self.data[nu] = {"pw": np or "1234", "binders": {"Main Binder": []}, "order": ["Main Binder"]}
+            self.data[nu] = {
+                "pw": np or "1234", 
+                "binders": {"Main Binder": []}, 
+                "order": ["Main Binder"],
+                "binder_layouts": {"Main Binder": {"rows": 3, "cols": 3, "pages": 10}}
+            }
             self.save_all_data(); win.destroy(); self.switch_user()
 
     # ==========================================
     # API & EXTERNAL DATA LOADERS
     # ==========================================
-    def setup_search_header(self):
-        # Redefining header setup to include both Set and Card search options
-        h = self.right_pane['header_tools']
-        for w in h.winfo_children(): w.destroy()
-        
-        # Grid Controls
-        g_f = tk.Frame(h); g_f.pack(side="left", padx=5)
-        tk.Label(g_f, text="Grid:", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.s_rows).pack(side="left")
-        tk.Label(g_f, text="x", font=("Arial", 8)).pack(side="left")
-        ttk.Entry(g_f, width=2, textvariable=self.s_cols).pack(side="left")
-        tk.Button(g_f, text="Set", command=self.refresh_view, font=("Arial", 8), padx=3).pack(side="left", padx=2)
-        
-        # Set Search Controls
-        l_f = tk.Frame(h); l_f.pack(side="left", padx=5)
-        tk.Label(l_f, text="Set:", font=("Arial", 8, "bold")).pack(side="left")
-        self.set_entry = ttk.Entry(l_f, width=12); self.set_entry.insert(0, "Surging Sparks"); self.set_entry.pack(side="left")
-        self.set_entry.bind("<Return>", self.handle_load)
-        tk.Button(l_f, text="Load", command=self.handle_load, bg="#3E4A89", fg="white", font=("Arial", 8)).pack(side="left", padx=2)
-        
-        # Card Search Controls (New)
-        c_f = tk.Frame(h); c_f.pack(side="left", padx=5)
-        tk.Label(c_f, text="Card:", font=("Arial", 8, "bold")).pack(side="left")
-        self.card_search_entry = ttk.Entry(c_f, width=12); self.card_search_entry.pack(side="left")
-        self.card_search_entry.bind("<Return>", self.handle_card_search)
-        tk.Button(c_f, text="Find", command=self.handle_card_search, bg="#E65100", fg="white", font=("Arial", 8)).pack(side="left", padx=2)
-
-        tk.Label(h, textvariable=self.progress_text, font=("Arial", 8, "bold"), fg="#4CAF50").pack(side="right", padx=10)
-
     def handle_load(self, event=None):
         q = self.set_entry.get().strip()
         self.status_var.set(f"Searching Set: {q}...")
@@ -801,8 +1019,38 @@ class TCGApp:
     def apply_theme(self):
         t = self.themes["lunar" if self.dark_mode.get() else "solar"]
         self.root.configure(bg=t["bg"]); self.menu_frame.configure(bg=t["menu"]); self.top.configure(bg=t["bg"])
+        
+        # Update Top Bar elements
+        self.menu_btn.configure(bg=t["btn"], fg=t["btn_text"], activebackground=t["hl"], activeforeground=t["bg"])
+        self.theme_btn.configure(bg=t["btn"], fg=t["text"], selectcolor=t["hl"], activebackground=t["hl"])
+        self.status_lbl.configure(bg=t["bg"], fg=t["text"])
+
         for p in [self.left_pane, self.right_pane]:
-            for comp in ["frame", "header", "header_tools", "container", "canvas", "grid"]: p[comp].configure(bg=t["bg"])
+            # Update main containers
+            for comp in ["frame", "header", "header_tools", "container", "canvas", "grid"]: 
+                p[comp].configure(bg=t["bg"])
+            
+            # Update persistent header children (Title, Filter, Nav controls)
+            for child in p['header'].winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(bg=t["bg"], fg=t["text"])
+                elif isinstance(child, tk.Entry):
+                    child.configure(bg=t["input_bg"], fg=t["input_fg"], insertbackground=t["input_fg"], highlightbackground=t["frame_fg"])
+                elif isinstance(child, tk.Frame): # This is the nav frame
+                    child.configure(bg=t["bg"])
+                    for nc in child.winfo_children():
+                        if isinstance(nc, tk.Label): 
+                            nc.configure(bg=t["bg"], fg=t["text"])
+                        elif isinstance(nc, tk.Button): 
+                            nc.configure(bg=t["btn"], fg=t["btn_text"], activebackground=t["hl"], activeforeground=t["bg"])
+                        elif isinstance(nc, tk.Entry): 
+                            nc.configure(bg=t["input_bg"], fg=t["input_fg"], insertbackground=t["input_fg"], highlightbackground=t["frame_fg"])
+        
+        # Rebuild headers and menu to apply new theme colors to buttons and entries
+        self.setup_binder_header()
+        self.setup_search_header()
+        self.setup_side_menu()
+        
         self.refresh_view()
 
     def refresh_view(self, target="both"):
@@ -870,18 +1118,116 @@ class TCGApp:
             self.owned_cards.remove(card_obj); self.save_all_data(); self.apply_binder_filter(reset_page=False)
 
     def apply_filter(self):
-        q = self.filter_var.get().lower(); self.display_search_data = [c for c in self.full_set_data if q in c['name'].lower()] if q else self.full_set_data.copy()
+        q = self.filter_var.get().lower().strip()
+        
+        if not q:
+            self.display_search_data = self.full_set_data.copy()
+        else:
+            # Check if filtering by number (starts with # or is digit)
+            is_num_search = q.startswith('#') or q.isdigit()
+            
+            # Normalize search term: remove '#' and leading zeros
+            search_num = q.lstrip('#').lstrip('0') if is_num_search else ""
+            if is_num_search and search_num == "": search_num = "0"
+
+            filtered = []
+            for c in self.full_set_data:
+                if is_num_search:
+                    # Ensure card number exists (extract if missing)
+                    if 'card_number' not in c:
+                        try:
+                            if '-' in c['id']: c['card_number'] = c['id'].split('-')[-1]
+                            elif 'image' in c:
+                                match = re.search(r'/([^/]+)/low\.jpg', c['image'])
+                                if match: c['card_number'] = match.group(1)
+                            else: c['card_number'] = "0"
+                        except: c['card_number'] = "0"
+
+                    # Normalize card number
+                    c_num = str(c.get('card_number', '')).lstrip('0')
+                    if not c_num: c_num = "0"
+                    
+                    if c_num == search_num:
+                        filtered.append(c)
+                else:
+                    if q in c['name'].lower():
+                        filtered.append(c)
+            self.display_search_data = filtered
+
         self.search_page = 1; self.refresh_view(target="search")
 
     def apply_binder_filter(self, reset_page=False):
-        q = self.binder_filter_var.get().lower(); self.display_owned_cards = [c for c in self.owned_cards if q in c['name'].lower()] if q else self.owned_cards.copy()
+        q = self.binder_filter_var.get().lower().strip()
+        
+        if not q:
+            self.display_owned_cards = self.owned_cards.copy()
+        else:
+            # Check if filtering by number (starts with # or is digit)
+            is_num_search = q.startswith('#') or q.isdigit()
+            
+            # Normalize search term: remove '#' and leading zeros (e.g. "#023" -> "23")
+            search_num = q.lstrip('#').lstrip('0') if is_num_search else ""
+            if is_num_search and search_num == "": search_num = "0" # Handle searching for "0"
+
+            filtered = []
+            for c in self.owned_cards:
+                if is_num_search:
+                    # Normalize card number: remove leading zeros
+                    c_num = str(c.get('card_number', '')).lstrip('0')
+                    if not c_num: c_num = "0"
+                    
+                    # Exact match on normalized number
+                    if c_num == search_num:
+                        filtered.append(c)
+                else:
+                    # Standard name search
+                    if q in c['name'].lower():
+                        filtered.append(c)
+            self.display_owned_cards = filtered
+
         if reset_page: self.binder_page = 1; self.jump_binder_var.set("1")
         self.refresh_view(target="binder")
+
+    def start_ticker(self, text):
+        if self._ticker_job:
+            self.root.after_cancel(self._ticker_job)
+            self._ticker_job = None
+        
+        max_len = 28 # Max characters to display
+        if len(text) <= max_len:
+            self.progress_scroll_var.set(text)
+            return
+
+        display_text = text + "   ***   "
+        
+        def tick(idx):
+            s = display_text + display_text
+            view = s[idx : idx + max_len]
+            self.progress_scroll_var.set(view)
+            self._ticker_job = self.root.after(200, lambda: tick((idx + 1) % len(display_text)))
+        
+        tick(0)
 
     def update_progress(self):
         if self.current_set_name:
             o = len([c for c in self.owned_cards if c.get('set_name') == self.current_set_name]); t = len(self.full_set_data)
-            self.progress_text.set(f"{self.current_set_name}: {o}/{t} ({(o/t)*100:.1f}%)" if t else "No data")
+            pct = (o/t)*100 if t else 0
+            text = f"{self.current_set_name}: {o}/{t} ({pct:.1f}%)" if t else "No data"
+            
+            # Dynamic color coding
+            if hasattr(self, 'progress_label'):
+                t_theme = self.themes["lunar" if self.dark_mode.get() else "solar"]
+                if pct == 100: col = t_theme["prog_100"]
+                elif pct >= 75: col = t_theme["prog_75"]
+                elif pct >= 50: col = t_theme["prog_50"]
+                elif pct >= 25: col = t_theme["prog_25"]
+                else: col = t_theme["prog_0"]
+                self.progress_label.config(fg=col)
+
+            # Only restart ticker if text changes
+            if self.progress_text.get() != text:
+                self.progress_text.set(text)
+                self.start_ticker(text)
 
 if __name__ == "__main__":
     try:
