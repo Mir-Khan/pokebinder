@@ -547,12 +547,31 @@ class TCGApp:
         """Creates the batch script and restarts."""
         current_exe = os.path.basename(sys.executable)
         
-        # Create a batch script to swap files
+        # Create a batch script to swap files robustly
         bat_script = f"""
 @echo off
-timeout /t 2 /nobreak > NUL
-del "{current_exe}"
-move "{new_exe}" "{current_exe}"
+:WAIT_LOOP
+tasklist | find /i "{current_exe}" >nul
+if %errorlevel% == 0 (
+    timeout /t 1 /nobreak >nul
+    goto WAIT_LOOP
+)
+
+:DELETE_OLD
+if exist "{current_exe}" (
+    del /f /q "{current_exe}"
+    if exist "{current_exe}" (
+        timeout /t 1 /nobreak >nul
+        goto DELETE_OLD
+    )
+)
+
+:RENAME_NEW
+move /y "{new_exe}" "{current_exe}"
+
+:CLEANUP_ARTIFACTS
+if exist "python.exe" del /f /q "python.exe"
+
 start "" "{current_exe}"
 del "%~f0"
 """
